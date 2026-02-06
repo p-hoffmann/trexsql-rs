@@ -1,0 +1,174 @@
+name: Vendor
+on:
+  workflow_call:
+    inputs:
+      trexsql-sha:
+        description: 'Vendor Specific TrexSQL SHA'
+        required: false
+        default: ''
+        type: 'string'
+  workflow_dispatch:
+    inputs:
+      trexsql-sha:
+        description: 'Vendor Specific TrexSQL SHA'
+        required: false
+        default: ''
+        type: 'string'
+
+jobs:
+  vendor:
+    name: "Update Vendored Sources"
+    if: ${{ github.repository == 'p-hoffmann/trexsql-rs' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        id: setup_python
+        with:
+          python-version: '3.12'
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout engine
+        uses: actions/checkout@v4
+        id: checkout_engine
+        with:
+          repository: p-hoffmann/trexsql
+          path: .git/trexsql
+          fetch-depth: 0
+
+      - name: Checkout engine rev
+        id: checkout_engine_rev
+        if: ${{ inputs.trexsql-sha != '' }}
+        working-directory: .git/trexsql
+        run: |
+          echo "Checking out engine ref: ${{ inputs.trexsql-sha }} on branch: ${{ github.ref_name }}"
+          git checkout ${{ inputs.trexsql-sha }}
+
+      - name: Vendor sources
+        if: ${{ steps.checkout_engine_rev.outcome == 'success' }}
+        id: vendor
+        run: |
+          REV=$(cd .git/trexsql && git rev-parse --short HEAD && cd ../..)
+          echo "Updating vendored TrexSQL sources to ${REV}"
+          git config --global user.email "github_bot@trexsql.com"
+          git config --global user.name "TrexSQL GitHub Bot"
+          # Vendoring branch must exist, it may or may not already have
+          # a pending PR on it, we are rebasing it anyway
+          git checkout vendoring-${{ github.ref_name }}
+          git rebase ${{ github.ref_name }}
+          # Update the submodule to point to the checked-out engine
+          cd crates/libduckdb-sys/duckdb-sources
+          git fetch ../../.git/trexsql
+          git checkout ${REV}
+          cd ../../..
+          # Regenerate vendored sources
+          cd crates/libduckdb-sys
+          python3 update_sources.py
+          cd ../..
+          # Clean up
+          rm -rf .git/trexsql
+          # Export vendor revision for use in later steps
+          echo "vendor_rev=${REV}" >> "${GITHUB_OUTPUT}"
+
+      - name: Regenerate bindgen
+        if: ${{ steps.vendor.outcome == 'success' }}
+        id: regenerate_bindgen
+        run: |
+          cd crates/libduckdb-sys
+          cargo clean
+          mkdir -p ../../target duckdb
+          export DUCKDB_LIB_DIR="$(pwd)/duckdb"
+          # Generate loadable extension bindgen
+          rm -f src/bindgen_bundled_version_loadable.rs
+          find ../../target -type f -name bindgen.rs -exec rm {} \;
+          cargo build --features "extensions-full buildtime_bindgen loadable-extension"
+          find ../../target -type f -name bindgen.rs -exec cp {} src/bindgen_bundled_version_loadable.rs \;
+          # Generate standard bindgen
+          rm -f src/bindgen_bundled_version.rs
+          find ../../target -type f -name bindgen.rs -exec rm {} \;
+          cargo build --features "extensions-full buildtime_bindgen"
+          find ../../target -type f -name bindgen.rs -exec cp {} src/bindgen_bundled_version.rs \;
+
+      - name: Check for incoming changes
+        if: ${{ steps.vendor.outcome == 'success' }}
+        id: check_for_changes
+        run: |
+          if git diff --exit-code; then
+            echo "No vendoring changes detected, skipping the remaining of the job."
+          else
+            echo "Changes detected, proceeding with commit and push."
+            echo "has_changes=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Commit and push the changes
+        id: commit_and_push
+        if: ${{ steps.check_for_changes.outcome == 'success' && steps.check_for_changes.outputs.has_changes == 'true' }}
+        run: |
+          MSG="Update vendored TrexSQL sources to ${{ steps.vendor.outputs.vendor_rev }}"
+          git add crates/libduckdb-sys/duckdb.tar.gz crates/libduckdb-sys/src/bindgen_bundled_version.rs crates/libduckdb-sys/src/bindgen_bundled_version_loadable.rs
+          git commit -m "${MSG}"
+          git push -f origin vendoring-${{ github.ref_name }}
+          echo "commit_msg=${MSG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check PR exists
+        id: check_pr_exists
+        if: ${{ steps.commit_and_push.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=$(gh pr list --head vendoring-${{ github.ref_name }} --json number --jq '.[].number')
+          if [ -z "${PR_NUM}" ]; then
+            echo "No PR exists for branch vendoring-${{ github.ref_name }}"
+            echo "pr_exists=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "PR found for branch vendoring-${{ github.ref_name }}, number: ${PR_NUM}"
+            echo "pr_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "pr_num=${PR_NUM}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Prepare PR message
+        id: prepare_pr_message
+        if: ${{ steps.check_pr_exists.outcome == 'success' }}
+        run: |
+            DATE="$(date +"%Y-%m-%d %H:%M:%S")"
+            CHANGE_LABEL="p-hoffmann/trexsql#${{ steps.vendor.outputs.vendor_rev }}"
+            CHANGE_URL="https://github.com/p-hoffmann/trexsql/commit/${{ steps.vendor.outputs.vendor_rev }}"
+            MSG=" - [${CHANGE_LABEL}](${CHANGE_URL}) imported at ${DATE}"
+            echo "PR message: ${MSG}"
+            echo "pr_msg=${MSG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create PR
+        id: create_pr
+        if: ${{ steps.prepare_pr_message.outcome == 'success' && steps.check_pr_exists.outputs.pr_exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+            echo "Changes:" > body.txt
+            echo "${{ steps.prepare_pr_message.outputs.pr_msg }}" >> body.txt
+            sed -i '/^$/d' body.txt
+            gh pr create \
+             --head "vendoring-${{ github.ref_name }}" \
+             --base "${{ github.ref_name }}" \
+             --title "${{ steps.commit_and_push.outputs.commit_msg }}" \
+             --body-file body.txt
+
+      - name: Update PR
+        id: update_pr
+        if: ${{ steps.prepare_pr_message.outcome == 'success' && steps.check_pr_exists.outputs.pr_exists == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+            gh pr view vendoring-${{ github.ref_name }} --json body --jq '.body' > body.txt
+            echo "${{ steps.prepare_pr_message.outputs.pr_msg }}" >> body.txt
+            sed -i '/^$/d' body.txt
+            gh pr edit ${{ steps.check_pr_exists.outputs.pr_num }} \
+             --title "${{ steps.commit_and_push.outputs.commit_msg }}" \
+             --body-file body.txt
+            gh pr close ${{ steps.check_pr_exists.outputs.pr_num }}
+            gh pr reopen ${{ steps.check_pr_exists.outputs.pr_num }}

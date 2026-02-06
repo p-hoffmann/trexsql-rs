@@ -83,6 +83,7 @@ mod build_bundled {
 
     pub fn main(out_dir: &str, out_path: &Path) {
         let lib_name = super::lib_name();
+        let bundled_dir = super::bundled_dir_name();
 
         untar_archive(out_dir);
 
@@ -94,7 +95,7 @@ mod build_bundled {
         #[cfg(feature = "buildtime_bindgen")]
         {
             use super::{bindings, HeaderLocation};
-            let header = HeaderLocation::FromPath(format!("{out_dir}/{lib_name}/src/include/"));
+            let header = HeaderLocation::FromPath(format!("{out_dir}/{bundled_dir}/src/include/"));
             bindings::write_to_out_dir(header, out_path);
         }
 
@@ -111,7 +112,7 @@ mod build_bundled {
             .expect("Could not copy bindings to output directory");
         }
 
-        let manifest_file = std::fs::File::open(format!("{out_dir}/{lib_name}/manifest.json")).expect("manifest file");
+        let manifest_file = std::fs::File::open(format!("{out_dir}/{bundled_dir}/manifest.json")).expect("manifest file");
         let manifest: Manifest = serde_json::from_reader(manifest_file).expect("reading manifest file");
 
         let mut cpp_files = HashSet::new();
@@ -139,12 +140,12 @@ mod build_bundled {
 
         // Since the manifest controls the set of files, we require it to be changed to know whether
         // to rebuild the project
-        println!("cargo:rerun-if-changed={out_dir}/{lib_name}/manifest.json");
+        println!("cargo:rerun-if-changed={out_dir}/{bundled_dir}/manifest.json");
         // Make sure to rebuild the project if tar file changed
         println!("cargo:rerun-if-changed=duckdb.tar.gz");
 
-        cfg.include(lib_name);
-        cfg.includes(include_dirs.iter().map(|dir| format!("{out_dir}/{lib_name}/{dir}")));
+        cfg.include(bundled_dir);
+        cfg.includes(include_dirs.iter().map(|dir| format!("{out_dir}/{bundled_dir}/{dir}")));
 
         // Ensure deterministic builds
         let mut cpp_files_vec: Vec<String> = cpp_files.into_iter().collect();
@@ -169,6 +170,23 @@ mod build_bundled {
             cfg.define("NDEBUG", None);
         }
 
+        // Generate custom_signing_keys.cpp for extension signing support
+        println!("cargo:rerun-if-env-changed=DUCKDB_CUSTOM_SIGNING_KEYS");
+        let signing_keys_cpp = std::path::Path::new(out_dir).join("custom_signing_keys.cpp");
+        let signing_keys_content =
+            if let Ok(key_path) = std::env::var("DUCKDB_CUSTOM_SIGNING_KEYS") {
+                let key_content = std::fs::read_to_string(&key_path)
+                    .unwrap_or_else(|e| panic!("Failed to read signing key file {key_path}: {e}"));
+                format!(
+                    "namespace duckdb {{\nextern const char *const custom_public_keys[] = {{\nR\"({key_content})\",\nnullptr}};\n}} // namespace duckdb\n"
+                )
+            } else {
+                "namespace duckdb {\nextern const char *const custom_public_keys[] = {\nnullptr};\n} // namespace duckdb\n".to_string()
+            };
+        std::fs::write(&signing_keys_cpp, signing_keys_content)
+            .expect("Failed to write custom_signing_keys.cpp");
+        cfg.file(&signing_keys_cpp);
+
         if win_target() {
             cfg.define("DUCKDB_BUILD_LIBRARY", None);
         }
@@ -179,10 +197,14 @@ mod build_bundled {
 }
 
 fn env_prefix() -> &'static str {
-    "DUCKDB"
+    "TREXSQL"
 }
 
 fn lib_name() -> &'static str {
+    "trexsql"
+}
+
+fn bundled_dir_name() -> &'static str {
     "duckdb"
 }
 
@@ -280,10 +302,8 @@ mod build_linked {
                 println!("cargo:rerun-if-env-changed=VCPKGRS_DYNAMIC");
             }
 
-            // dependents can access `DEP_DUCKDB_LINK_TARGET` (`duckdb` being the
-            // `links=` value in our Cargo.toml) to get this value. This might be
-            // useful if you need to ensure whatever crypto library sqlcipher relies
-            // on is available, for example.
+            // dependents can access `DEP_TREXSQL_LINK_TARGET` (`trexsql` being the
+            // `links=` value in our Cargo.toml) to get this value.
             println!("cargo:link-target={link_lib}");
         }
 

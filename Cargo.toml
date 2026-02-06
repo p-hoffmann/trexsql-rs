@@ -9,8 +9,8 @@ members = [
 [workspace.package]
 version = "1.4.0"
 authors = ["wangfenjin <wangfenj@gmail.com>"]
-repository = "https://github.com/duckdb/duckdb-rs"
-homepage = "https://github.com/duckdb/duckdb-rs"
+repository = "https://github.com/p-hoffmann/trexsql-rs"
+homepage = "https://github.com/p-hoffmann/trexsql-rs"
 documentation = "http://docs.rs/duckdb/"
 readme = "README.md"
 keywords = ["duckdb", "database", "ffi"]

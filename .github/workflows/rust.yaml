@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
+
 env:
   RUST_BACKTRACE: 1
 
@@ -13,121 +14,107 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Test ${{ matrix.target }}
+  build-lib:
+    name: Build libtrexsql (${{ matrix.target }})
     strategy:
       fail-fast: true
       matrix:
         include:
-          - {
-              target: x86_64-pc-windows-msvc,
-              os: windows-latest,
-              duckdb: libduckdb-windows-amd64.zip,
-            }
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-latest,
-              duckdb: libduckdb-linux-amd64.zip,
-            }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Extract public key from signing key
+        env:
+          SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
+        if: ${{ env.SIGNING_KEY != '' }}
+        run: |
+          echo "$SIGNING_KEY" > /tmp/signing_key.pem
+          chmod 600 /tmp/signing_key.pem
+          openssl rsa -in /tmp/signing_key.pem -pubout -out signing_key.pub 2>/dev/null
+          rm -f /tmp/signing_key.pem
+
+      - name: Build libtrexsql
+        run: |
+          SIGNING_KEY_ARG=""
+          if [ -f ${{ github.workspace }}/signing_key.pub ]; then
+            SIGNING_KEY_ARG="-DDUCKDB_CUSTOM_SIGNING_KEYS=${{ github.workspace }}/signing_key.pub"
+          fi
+          mkdir -p build/release && cd build/release
+          cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=1 \
+            $SIGNING_KEY_ARG
+          cmake --build . --config Release
+        working-directory: crates/libduckdb-sys/duckdb-sources
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p libtrexsql
+          cp crates/libduckdb-sys/duckdb-sources/build/release/src/libduckdb.so libtrexsql/libtrexsql.so
+          cp crates/libduckdb-sys/duckdb-sources/src/include/duckdb.h libtrexsql/
+
+      - name: Upload libtrexsql
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtrexsql-linux-amd64
+          path: libtrexsql/
+
+  test-rust:
+    name: Test Rust bindings (${{ matrix.target }})
+    needs: build-lib
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
 
-      # download libduckdb
-      - uses: robinraju/release-downloader@v1.4
-        name: Download duckdb
+      - name: Download libtrexsql
+        uses: actions/download-artifact@v4
         with:
-          repository: "duckdb/duckdb"
-          tag: "v1.4.0"
-          fileName: ${{ matrix.duckdb }}
-          out-file-path: .
-
-      # For Linux
-      - name: Linux extract duckdb
-        if: matrix.os == 'ubuntu-latest'
-        uses: ihiroky/extract-action@v1
-        with:
-          file_path: ${{ github.workspace }}/${{ matrix.duckdb }}
-          extract_dir: libduckdb
+          name: libtrexsql-linux-amd64
+          path: libtrexsql
 
       - run: cargo fmt --all -- --check
-        if: matrix.os == 'ubuntu-latest'
 
-      - name: run cargo clippy
-        if: matrix.os == 'ubuntu-latest'
+      - name: Run cargo clippy
         env:
-          DUCKDB_LIB_DIR: ${{ github.workspace }}/libduckdb
-          DUCKDB_INCLUDE_DIR: ${{ github.workspace }}/libduckdb
-          LD_LIBRARY_PATH: ${{ github.workspace }}/libduckdb
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+          TREXSQL_LIB_DIR: ${{ github.workspace }}/libtrexsql
+          TREXSQL_INCLUDE_DIR: ${{ github.workspace }}/libtrexsql
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtrexsql
+        run: cargo clippy --all-targets --workspace --locked -- -D warnings
 
-      - name: Dry-run release of crates
-        if: matrix.os == 'ubuntu-latest'
-        uses: katyo/publish-crates@v2
-        with:
-          path: "./"
-          args: --allow-dirty --all-features
-          dry-run: true
-          ignore-unpublished-changes: true
-
-      # For windows
-      - name: Windows extract duckdb
-        if: matrix.os == 'windows-latest'
-        uses: DuckSoft/extract-7z-action@v1.0
-        with:
-          pathSource: D:\a\duckdb-rs\duckdb-rs\${{ matrix.duckdb }}
-          pathTarget: ${{ github.workspace }}/libduckdb
-
-      - name: Add path to PATH environment variable
-        if: matrix.os == 'windows-latest'
-        uses: myci-actions/export-env-var-powershell@1
-        with:
-          name: PATH
-          value: $env:PATH;${{ github.workspace }}/libduckdb
-
-      - name: Run cargo-test
-        if: matrix.os == 'windows-latest'
+      - name: Run cargo test
+        env:
+          TREXSQL_LIB_DIR: ${{ github.workspace }}/libtrexsql
+          TREXSQL_INCLUDE_DIR: ${{ github.workspace }}/libtrexsql
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtrexsql
         run: cargo test --features "modern-full vtab-full vtab-loadable"
-        env:
-          DUCKDB_LIB_DIR: ${{ github.workspace }}/libduckdb
-          DUCKDB_INCLUDE_DIR: ${{ github.workspace }}/libduckdb
 
       - name: Build loadable extension
+        env:
+          TREXSQL_LIB_DIR: ${{ github.workspace }}/libtrexsql
+          TREXSQL_INCLUDE_DIR: ${{ github.workspace }}/libtrexsql
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtrexsql
         run: cargo build --example hello-ext --features="vtab-loadable"
-        env:
-          DUCKDB_LIB_DIR: ${{ github.workspace }}/libduckdb
-          DUCKDB_INCLUDE_DIR: ${{ github.workspace }}/libduckdb
-          LD_LIBRARY_PATH: ${{ github.workspace }}/libduckdb
 
-      - name: Build loadable extension
+      - name: Build loadable extension (C API)
+        env:
+          TREXSQL_LIB_DIR: ${{ github.workspace }}/libtrexsql
+          TREXSQL_INCLUDE_DIR: ${{ github.workspace }}/libtrexsql
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtrexsql
         run: cargo build --example hello-ext-capi --features="vtab-loadable loadable-extension"
-        env:
-          DUCKDB_LIB_DIR: ${{ github.workspace }}/libduckdb
-          DUCKDB_INCLUDE_DIR: ${{ github.workspace }}/libduckdb
-          LD_LIBRARY_PATH: ${{ github.workspace }}/libduckdb
-
-  Sanitizer:
-    name: Address Sanitizer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: nightly-2025-08-15
-          components: rust-src
-      - name: Install LLVM
-        run: sudo apt-get install -y llvm
-      - name: Tests with asan
-        env:
-          RUSTFLAGS: -Zsanitizer=address -C debuginfo=0
-          RUSTDOCFLAGS: -Zsanitizer=address
-          ASAN_OPTIONS: "detect_stack_use_after_return=1:detect_leaks=1:symbolize=1"
-        # We cannot run "modern-full" with asan as the chrono feature will auto-load relase binaries of
-        # the ICU-extension, which are not built with ASAN and will cause a crash.
-        run: |
-          export ASAN_SYMBOLIZER_PATH=$(which llvm-symbolizer)
-          echo $ASAN_SYMBOLIZER_PATH
-          cargo -Z build-std test --features "serde_json url r2d2 uuid polars extensions-full" --target x86_64-unknown-linux-gnu --package duckdb

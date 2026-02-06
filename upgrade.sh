@@ -20,8 +20,8 @@ get_latest_release() {
       sed -E 's/.*"v([^"]+)".*/\1/'                                   # Pluck JSON value
 }
 
-duckdb_version=$(get_latest_release "duckdb/duckdb")
-duckdb_rs_version=$(get_latest_release "duckdb/duckdb-rs")
+duckdb_version=$(get_latest_release "p-hoffmann/trexsql")
+duckdb_rs_version=$(get_latest_release "p-hoffmann/trexsql-rs")
 
 if [ $duckdb_version = $duckdb_rs_version ]; then
     echo "Already update to date, latest version is $duckdb_version"
