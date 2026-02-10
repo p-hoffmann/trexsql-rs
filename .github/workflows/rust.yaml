@@ -51,14 +51,15 @@ jobs:
           mkdir -p build/release && cd build/release
           cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=1 \
+            -DBUILD_UNITTESTS=OFF \
             $SIGNING_KEY_ARG
-          cmake --build . --config Release
+          cmake --build . --config Release --target trexsql
         working-directory: crates/libduckdb-sys/duckdb-sources
 
       - name: Prepare artifacts
         run: |
           mkdir -p libtrexsql
-          cp crates/libduckdb-sys/duckdb-sources/build/release/src/libduckdb.so libtrexsql/libtrexsql.so
+          cp crates/libduckdb-sys/duckdb-sources/build/release/src/libtrexsql.so libtrexsql/libtrexsql.so
           cp crates/libduckdb-sys/duckdb-sources/src/include/duckdb.h libtrexsql/
 
       - name: Upload libtrexsql
