@@ -44,6 +44,7 @@ jobs:
 
       - name: Build libtrexsql
         run: |
+          TREXSQL_VERSION="v$(grep '^version' ${{ github.workspace }}/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           SIGNING_KEY_ARG=""
           if [ -f ${{ github.workspace }}/signing_key.pub ]; then
             SIGNING_KEY_ARG="-DDUCKDB_CUSTOM_SIGNING_KEYS=${{ github.workspace }}/signing_key.pub"
@@ -52,6 +53,7 @@ jobs:
           cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=1 \
             -DBUILD_UNITTESTS=OFF \
+            -DOVERRIDE_GIT_DESCRIBE="$TREXSQL_VERSION" \
             $SIGNING_KEY_ARG
           cmake --build . --config Release --target trexsql
         working-directory: crates/libduckdb-sys/duckdb-sources
