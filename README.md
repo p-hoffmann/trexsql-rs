@@ -82,8 +82,7 @@ The following [examples](crates/duckdb/examples) demonstrate various features an
 - **appender** - Bulk data insertion using the appender API with transactions.
 - **parquet** - Reading Parquet files directly using DuckDB's Parquet extension.
 - **repl** - Interactive SQL REPL.
-- **hello-ext** - A loadable DuckDB extension using the legacy extension API.
-- **hello-ext-capi** - A loadable DuckDB extension using the modern extension API.
+- **hello-ext** - A loadable DuckDB extension.
 
 Run any example with `cargo run --example <name>`.
 
@@ -96,7 +95,6 @@ The `duckdb` crate provides a number of Cargo features that can be enabled to ad
 - `vtab` - Base support for creating custom table functions and virtual tables.
 - `vtab-arrow` - Apache Arrow integration for virtual tables. Enables conversion between Arrow RecordBatch and DuckDB data chunks.
 - `vtab-excel` - Read Excel (.xlsx) files directly in SQL queries with automatic schema detection.
-- `vtab-loadable` - Support for creating loadable DuckDB extensions. Includes procedural macros for extension development.
 - `vscalar` - Create custom scalar functions that operate on individual values or rows.
 - `vscalar-arrow` - Arrow-optimized scalar functions for vectorized operations.
 
@@ -117,7 +115,38 @@ The `duckdb` crate provides a number of Cargo features that can be enabled to ad
 
 - `bundled` - Uses a bundled version of DuckDB's source code and compiles it during build. This is the simplest way to get started and avoids needing DuckDB system libraries.
 - `buildtime_bindgen` - Use bindgen at build time to generate fresh bindings instead of using pre-generated ones.
-- `loadable-extension` - _Experimental_ support for building extensions that can be dynamically loaded into DuckDB.
+- `loadable-extension` - _Experimental_ support for creating loadable DuckDB extensions. Includes procedural macros for extension development.
+
+## Installation
+
+### Using stable releases from crates.io
+
+The recommended way to use duckdb-rs is to add it from crates.io:
+
+```shell
+cargo add duckdb -F bundled
+```
+
+Or manually add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+duckdb = { version = "=1.4.4", features = ["bundled"] }
+```
+
+### Using the development version from git
+
+To use the latest development version from the main branch, you can specify a git dependency in your `Cargo.toml`:
+
+```toml
+# Use a specific branch
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", branch = "main", features = ["bundled"] }
+
+# Use a specific commit
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", rev = "abc123def", features = ["bundled"] }
+```
+
+Note: Using the main branch of duckdb-rs means you'll get the latest Rust bindings and features, but you'll still be using whatever version of DuckDB core is bundled with that commit (when using the `bundled` feature).
 
 ## Notes on building duckdb and libduckdb-sys
 
@@ -142,7 +171,7 @@ You can adjust this behavior in a number of ways:
 
    ```toml
    [dependencies]
-   duckdb = { version = "1.3.2", features = ["bundled"] }
+   duckdb = { version = "1.4.1", features = ["bundled"] }
    ```
 
 2. When linking against a DuckDB library already on the system (so _not_ using any of the `bundled` features), you can set the `DUCKDB_LIB_DIR` environment variable to point to a directory containing the library. You can also set the `DUCKDB_INCLUDE_DIR` variable to point to the directory containing `duckdb.h`.
@@ -150,7 +179,7 @@ You can adjust this behavior in a number of ways:
    Linux example:
 
    ```shell
-   wget https://github.com/duckdb/duckdb/releases/download/v1.3.2/libduckdb-linux-arm64.zip
+   wget https://github.com/duckdb/duckdb/releases/download/v1.4.1/libduckdb-linux-arm64.zip
    unzip libduckdb-linux-arm64.zip -d libduckdb
 
    export DUCKDB_LIB_DIR=$PWD/libduckdb
@@ -163,7 +192,7 @@ You can adjust this behavior in a number of ways:
    macOS example:
 
    ```shell
-   wget https://github.com/duckdb/duckdb/releases/download/v1.3.2/libduckdb-osx-universal.zip
+   wget https://github.com/duckdb/duckdb/releases/download/v1.4.1/libduckdb-osx-universal.zip
    unzip libduckdb-osx-universal.zip -d libduckdb
 
    export DUCKDB_LIB_DIR=$PWD/libduckdb
@@ -173,11 +202,29 @@ You can adjust this behavior in a number of ways:
    cargo build --examples
    ```
 
-3. Installing the duckdb development packages will usually be all that is required, but
+3. _Experimental:_ Setting `DUCKDB_DOWNLOAD_LIB=1` makes the build script download pre-built DuckDB binaries from GitHub Releases. This always links against the dynamic library in the archive (setting `DUCKDB_STATIC` has no effect), and it effectively automates the manual steps above. The archives are cached in `target/duckdb-download/<target>/<version>` and that directory is automatically added to the linker search path. The downloaded version always matches the `libduckdb-sys` crate version.
+
+   ```shell
+   DUCKDB_DOWNLOAD_LIB=1 cargo test
+   ```
+
+4. Installing the duckdb development packages will usually be all that is required, but
    the build helpers for [pkg-config](https://github.com/alexcrichton/pkg-config-rs)
    and [vcpkg](https://github.com/mcgoo/vcpkg-rs) have some additional configuration
    options. The default when using vcpkg is to dynamically link,
    which must be enabled by setting `VCPKGRS_DYNAMIC=1` environment variable before build.
+
+When none of the options above are used, the build script falls back to this discovery path and will emit the appropriate `cargo:rustc-link-lib` directives if DuckDB is found on your system.
+
+### ICU extension and the bundled feature
+
+When using the `bundled` feature, the ICU extension is not included due to crates.io's 10MB package size limit. This means some date/time operations (like `now() - interval '1 day'` or `ts::date` casts) will fail. You can load ICU at runtime:
+
+```rust,ignore
+conn.execute_batch("INSTALL icu; LOAD icu;")?;
+```
+
+Alternatively, link against libduckdb without the `bundled` feature (see build instructions above). The ICU extension will be built-in and pre-loaded in that case.
 
 ### Binding generation
 

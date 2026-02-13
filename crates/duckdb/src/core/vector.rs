@@ -137,10 +137,7 @@ impl Inserter<CString> for FlatVector {
 
 impl Inserter<&str> for FlatVector {
     fn insert(&self, index: usize, value: &str) {
-        let cstr = CString::new(value.as_bytes()).unwrap();
-        unsafe {
-            duckdb_vector_assign_string_element(self.ptr, index as u64, cstr.as_ptr());
-        }
+        self.insert(index, value.as_bytes());
     }
 }
 
@@ -229,6 +226,12 @@ impl ListVector {
     pub fn set_entry(&mut self, idx: usize, offset: usize, length: usize) {
         self.entries.as_mut_slice::<duckdb_list_entry>()[idx].offset = offset as u64;
         self.entries.as_mut_slice::<duckdb_list_entry>()[idx].length = length as u64;
+    }
+
+    /// Get offset and length for the entry at index.
+    pub fn get_entry(&self, idx: usize) -> (usize, usize) {
+        let entry = self.entries.as_slice::<duckdb_list_entry>()[idx];
+        (entry.offset as usize, entry.length as usize)
     }
 
     /// Set row as null
@@ -368,7 +371,7 @@ impl StructVector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DataChunkHandle, LogicalTypeId};
+    use crate::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
     use std::ffi::CString;
 
     #[test]
@@ -394,5 +397,22 @@ mod tests {
             1,
             &vec![0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64],
         );
+    }
+
+    #[test]
+    fn test_list_vector_get_entry() {
+        let list_type = LogicalTypeHandle::list(&LogicalTypeId::Integer.into());
+        let chunk = DataChunkHandle::new(&[list_type]);
+        chunk.set_len(3);
+
+        let mut list_vector = chunk.list_vector(0);
+
+        list_vector.set_entry(0, 0, 2);
+        list_vector.set_entry(1, 2, 1);
+        list_vector.set_entry(2, 3, 2);
+
+        assert_eq!(list_vector.get_entry(0), (0, 2));
+        assert_eq!(list_vector.get_entry(1), (2, 1));
+        assert_eq!(list_vector.get_entry(2), (3, 2));
     }
 }

@@ -23,9 +23,10 @@ pub use arrow::{ArrowFunctionSignature, ArrowScalarParams, VArrowScalar};
 
 /// Duckdb scalar function trait
 pub trait VScalar: Sized {
-    /// State that persists across invocations of the scalar function (the lifetime of the connection)
-    /// The state can be accessed by multiple threads, so it must be `Send + Sync`.
-    type State: Sized + Send + Sync;
+    /// State set at registration time. Persists for the lifetime of the catalog entry.
+    /// Shared across worker threads and invocations — must not be modified during execution.
+    /// Must be `'static` as it is stored in DuckDB and may outlive the current stack frame.
+    type State: Sized + Send + Sync + 'static;
     /// The actual function
     ///
     /// # Safety
@@ -44,6 +45,21 @@ pub trait VScalar: Sized {
     /// These will result in DuckDB scalar function overloads.
     /// The invoke method should be able to handle all of these signatures.
     fn signatures() -> Vec<ScalarFunctionSignature>;
+
+    /// Whether the scalar function is volatile.
+    ///
+    /// Volatile functions are re-evaluated for each row, even if they have no parameters.
+    /// This is useful for functions that generate random or unique values, such as random
+    /// number generators, UUID generators, or fake data generators.
+    ///
+    /// By default, DuckDB optimizes zero-argument scalar functions as constants, evaluating
+    /// them only once. Returning true from this method prevents this optimization.
+    ///
+    /// # Default
+    /// Returns `false` by default, meaning the function is not volatile.
+    fn volatile() -> bool {
+        false
+    }
 }
 
 /// Duckdb scalar function parameters
@@ -109,7 +125,7 @@ impl From<duckdb_function_info> for ScalarFunctionInfo {
 }
 
 impl ScalarFunctionInfo {
-    pub unsafe fn get_scalar_extra_info<T>(&self) -> &T {
+    pub unsafe fn get_extra_info<T>(&self) -> &T {
         &*(duckdb_scalar_function_get_extra_info(self.0).cast())
     }
 
@@ -125,14 +141,14 @@ where
 {
     let info = ScalarFunctionInfo::from(info);
     let mut input = DataChunkHandle::new_unowned(input);
-    let result = T::invoke(info.get_scalar_extra_info(), &mut input, &mut output);
+    let result = T::invoke(info.get_extra_info(), &mut input, &mut output);
     if let Err(e) = result {
         info.set_error(&e.to_string());
     }
 }
 
 impl Connection {
-    /// Register the given ScalarFunction with default state
+    /// Register the given ScalarFunction with default state.
     #[inline]
     pub fn register_scalar_function<S: VScalar>(&self, name: &str) -> crate::Result<()>
     where
@@ -143,13 +159,18 @@ impl Connection {
             let scalar_function = ScalarFunction::new(name)?;
             signature.register_with_scalar(&scalar_function);
             scalar_function.set_function(Some(scalar_func::<S>));
+            if S::volatile() {
+                scalar_function.set_volatile();
+            }
             scalar_function.set_extra_info(S::State::default());
             set.add_function(scalar_function)?;
         }
         self.db.borrow_mut().register_scalar_function_set(set)
     }
 
-    /// Register the given ScalarFunction with custom state
+    /// Register the given ScalarFunction with custom state.
+    ///
+    /// The state is cloned once per function signature (overload) and stored in DuckDB's catalog.
     #[inline]
     pub fn register_scalar_function_with_state<S: VScalar>(&self, name: &str, state: &S::State) -> crate::Result<()>
     where
@@ -160,6 +181,9 @@ impl Connection {
             let scalar_function = ScalarFunction::new(name)?;
             signature.register_with_scalar(&scalar_function);
             scalar_function.set_function(Some(scalar_func::<S>));
+            if S::volatile() {
+                scalar_function.set_volatile();
+            }
             scalar_function.set_extra_info(state.clone());
             set.add_function(scalar_function)?;
         }
@@ -368,6 +392,105 @@ mod test {
                 assert_eq!(array.value(i), "Ho ho ho 🎅🎄Ho ho ho 🎅🎄Ho ho ho 🎅🎄");
             }
         }
+
+        Ok(())
+    }
+
+    // Counters for testing volatile functions
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static NON_VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct CounterScalar {}
+
+    impl VScalar for CounterScalar {
+        type State = ();
+
+        unsafe fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let len = input.len();
+            let mut output_vec = output.flat_vector();
+            let data = output_vec.as_mut_slice::<i64>();
+
+            for item in data.iter_mut().take(len) {
+                *item = NON_VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+            }
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![],
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            )]
+        }
+    }
+
+    struct VolatileCounterScalar {}
+
+    impl VScalar for VolatileCounterScalar {
+        type State = ();
+
+        unsafe fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let len = input.len();
+            let mut output_vec = output.flat_vector();
+            let data = output_vec.as_mut_slice::<i64>();
+
+            for item in data.iter_mut().take(len) {
+                *item = VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+            }
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![],
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            )]
+        }
+
+        fn volatile() -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_volatile_scalar() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+
+        VOLATILE_COUNTER.store(0, Ordering::SeqCst);
+        conn.register_scalar_function::<VolatileCounterScalar>("volatile_counter")?;
+
+        let values: Vec<i64> = conn
+            .prepare("SELECT volatile_counter() FROM generate_series(1, 5)")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+
+        assert_eq!(values, [0, 1, 2, 3, 4]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_volatile_scalar() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+
+        NON_VOLATILE_COUNTER.store(0, Ordering::SeqCst);
+        conn.register_scalar_function::<CounterScalar>("non_volatile_counter")?;
+
+        // Constant folding should make every row identical
+        let distinct_count: i64 = conn
+            .prepare("SELECT COUNT(DISTINCT non_volatile_counter()) FROM generate_series(1, 5)")?
+            .query_row([], |row| row.get(0))?;
+
+        assert_eq!(distinct_count, 1);
 
         Ok(())
     }

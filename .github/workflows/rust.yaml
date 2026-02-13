@@ -22,6 +22,8 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
     runs-on: ${{ matrix.os }}
+    env:
+      DUCKDB_DOWNLOAD_LIB: "1"
     steps:
       - uses: actions/checkout@v4
         with:

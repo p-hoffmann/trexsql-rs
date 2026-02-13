@@ -69,8 +69,8 @@ pub fn duckdb_entrypoint_c_api(attr: TokenStream, item: TokenStream) -> TokenStr
                 /// # Safety
                 ///
                 /// Internal Entrypoint for error handling
-                pub unsafe fn #c_entrypoint_internal(info: ffi::duckdb_extension_info, access: *const ffi::duckdb_extension_access) -> Result<bool, Box<dyn std::error::Error>> {
-                    let have_api_struct = ffi::duckdb_rs_extension_api_init(info, access, #minimum_duckdb_version).unwrap();
+                pub unsafe fn #c_entrypoint_internal(info: ::duckdb::ffi::duckdb_extension_info, access: *const ::duckdb::ffi::duckdb_extension_access) -> ::std::result::Result<bool, Box<dyn ::std::error::Error>> {
+                    let have_api_struct = ::duckdb::ffi::duckdb_rs_extension_api_init(info, access, #minimum_duckdb_version).unwrap();
 
                     if !have_api_struct {
                         // initialization failed to return an api struct, likely due to an API version mismatch, we can simply return here
@@ -78,8 +78,8 @@ pub fn duckdb_entrypoint_c_api(attr: TokenStream, item: TokenStream) -> TokenStr
                     }
 
                     // TODO: handle error here?
-                    let db : ffi::duckdb_database = *(*access).get_database.unwrap()(info);
-                    let connection = Connection::open_from_raw(db.cast())?;
+                    let db: ::duckdb::ffi::duckdb_database = *(*access).get_database.unwrap()(info);
+                    let connection = ::duckdb::Connection::open_from_raw(db.cast())?;
 
                     #prefixed_original_function(connection)?;
 
@@ -90,11 +90,11 @@ pub fn duckdb_entrypoint_c_api(attr: TokenStream, item: TokenStream) -> TokenStr
                 ///
                 /// Entrypoint that will be called by DuckDB
                 #[no_mangle]
-                pub unsafe extern "C" fn #c_entrypoint(info: ffi::duckdb_extension_info, access: *const ffi::duckdb_extension_access) -> bool {
+                pub unsafe extern "C" fn #c_entrypoint(info: ::duckdb::ffi::duckdb_extension_info, access: *const ::duckdb::ffi::duckdb_extension_access) -> bool {
                     let init_result = #c_entrypoint_internal(info, access);
 
                     if let Err(x) = init_result {
-                        let error_c_string = std::ffi::CString::new(x.to_string());
+                        let error_c_string = ::std::ffi::CString::new(x.to_string());
 
                         match error_c_string {
                             Ok(e) => {
@@ -115,55 +115,6 @@ pub fn duckdb_entrypoint_c_api(attr: TokenStream, item: TokenStream) -> TokenStr
             }
             .into()
         }
-        _ => panic!("Only function items are allowed on duckdb_entrypoint"),
-    }
-}
-
-/// Wraps an entrypoint function to expose an unsafe extern "C" function of the same name.
-#[proc_macro_attribute]
-pub fn duckdb_entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let ast = parse_macro_input!(item as syn::Item);
-    match ast {
-        Item::Fn(mut func) => {
-            let c_entrypoint = func.sig.ident.clone();
-            let c_entrypoint_version = Ident::new(
-                c_entrypoint.to_string().replace("_init", "_version").as_str(),
-                Span::call_site(),
-            );
-
-            let original_funcname = func.sig.ident.to_string();
-            func.sig.ident = Ident::new(format!("_{original_funcname}").as_str(), func.sig.ident.span());
-
-            let prefixed_original_function = func.sig.ident.clone();
-
-            quote_spanned! {func.span()=>
-                #func
-
-                /// # Safety
-                ///
-                /// Will be called by duckdb
-                #[unsafe(no_mangle)]
-                pub unsafe extern "C" fn #c_entrypoint(db: *mut std::ffi::c_void) {
-                    unsafe {
-                        let connection = Connection::open_from_raw(db.cast()).expect("can't open db connection");
-                        #prefixed_original_function(connection).expect("init failed");
-                    }
-                }
-
-                /// # Safety
-                ///
-                /// Predefined function, don't need to change unless you are sure
-                #[unsafe(no_mangle)]
-                pub unsafe extern "C" fn #c_entrypoint_version() -> *const std::ffi::c_char {
-                    unsafe {
-                        ffi::duckdb_library_version()
-                    }
-                }
-
-
-            }
-            .into()
-        }
-        _ => panic!("Only function items are allowed on duckdb_entrypoint"),
+        _ => panic!("Only function items are allowed on duckdb_entrypoint_c_api"),
     }
 }

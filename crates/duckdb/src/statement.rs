@@ -12,6 +12,14 @@ use crate::{
 };
 
 /// A prepared statement.
+///
+/// # Thread Safety
+///
+/// `Statement` is neither `Send` nor `Sync`:
+/// - Not `Send` because it holds a reference to `Connection`, which is `!Sync`
+/// - Not `Sync` because DuckDB prepared statements don't support concurrent access
+///
+/// See the [DuckDB concurrency documentation](https://duckdb.org/docs/stable/connect/concurrency.html) for more details.
 pub struct Statement<'conn> {
     conn: &'conn Connection,
     pub(crate) stmt: RawStatement,
@@ -429,6 +437,39 @@ impl Statement<'_> {
         self.stmt.bind_parameter_count()
     }
 
+    /// Returns the name of the parameter at the given index.
+    ///
+    /// This can be used to query the names of named parameters (e.g., `$param_name`)
+    /// in a prepared statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `one_based_col_index` - One-based parameter index (1 to [`Statement::parameter_count`])
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(String)` - The parameter name (without the `$` prefix for named params, or the numeric index for positional params)
+    /// * `Err(InvalidParameterIndex)` - If the index is out of range
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use duckdb::{Connection, Result};
+    /// fn query_parameter_names(conn: &Connection) -> Result<()> {
+    ///     let stmt = conn.prepare("SELECT $foo, $bar")?;
+    ///
+    ///     assert_eq!(stmt.parameter_count(), 2);
+    ///     assert_eq!(stmt.parameter_name(1)?, "foo");
+    ///     assert_eq!(stmt.parameter_name(2)?, "bar");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[inline]
+    pub fn parameter_name(&self, idx: usize) -> Result<String> {
+        self.stmt.parameter_name(idx)
+    }
+
     /// Low level API to directly bind a parameter to a given index.
     ///
     /// Note that the index is one-based, that is, the first parameter index is
@@ -820,6 +861,77 @@ mod test {
         Ok(())
     }
 
+    // When using RETURNING clauses, DuckDB core treats the statement as a query result instead of a modification
+    // statement. This causes execute() to return 0 changed rows and insert() to fail with an error.
+    // This test demonstrates current behavior and proper usage patterns for RETURNING clauses.
+    #[test]
+    fn test_insert_with_returning_clause() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE SEQUENCE location_id_seq START WITH 1 INCREMENT BY 1;
+             CREATE TABLE location (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('location_id_seq'),
+                 name TEXT NOT NULL
+             )",
+        )?;
+
+        // INSERT without RETURNING using execute
+        let changes = db.execute("INSERT INTO location (name) VALUES (?)", ["test1"])?;
+        assert_eq!(changes, 1);
+
+        // INSERT with RETURNING using execute - returns 0 (known limitation)
+        let changes = db.execute("INSERT INTO location (name) VALUES (?) RETURNING id", ["test2"])?;
+        assert_eq!(changes, 0);
+
+        // Verify the row was actually inserted despite returning 0
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM location", [], |r| r.get(0))?;
+        assert_eq!(count, 2);
+
+        // INSERT without RETURNING using insert
+        let mut stmt = db.prepare("INSERT INTO location (name) VALUES (?)")?;
+        stmt.insert(["test3"])?;
+
+        // INSERT with RETURNING using insert - fails (known limitation)
+        let mut stmt = db.prepare("INSERT INTO location (name) VALUES (?) RETURNING id")?;
+        let result = stmt.insert(["test4"]);
+        assert!(matches!(result, Err(Error::StatementChangedRows(0))));
+
+        // Verify the row was still inserted despite the error
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM location", [], |r| r.get(0))?;
+        assert_eq!(count, 4);
+
+        // Proper way to use RETURNING - with query_row
+        let id: i64 = db.query_row("INSERT INTO location (name) VALUES (?) RETURNING id", ["test5"], |r| {
+            r.get(0)
+        })?;
+        assert_eq!(id, 5);
+
+        // Proper way to use RETURNING - with query_map
+        let mut stmt = db.prepare("INSERT INTO location (name) VALUES (?) RETURNING id")?;
+        let ids: Vec<i64> = stmt
+            .query_map(["test6"], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 6);
+
+        // Proper way to use RETURNING - with query_one
+        let id: i64 = db
+            .prepare("INSERT INTO location (name) VALUES (?) RETURNING id")?
+            .query_one(["test7"], |r| r.get(0))?;
+        assert_eq!(id, 7);
+
+        // Multiple RETURNING columns
+        let (id, name): (i64, String) = db.query_row(
+            "INSERT INTO location (name) VALUES (?) RETURNING id, name",
+            ["test8"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(id, 8);
+        assert_eq!(name, "test8");
+
+        Ok(())
+    }
+
     #[test]
     fn test_exists() -> Result<()> {
         let db = Connection::open_in_memory()?;
@@ -1039,6 +1151,92 @@ mod test {
         let expected = "a\x00b";
         let actual: String = db.query_row("SELECT CAST(? AS VARCHAR)", [expected], |row| row.get(0))?;
         assert_eq!(expected, actual);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parameter_name() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        {
+            let stmt = db.prepare("SELECT $foo, $bar")?;
+
+            assert_eq!(stmt.parameter_count(), 2);
+            assert_eq!(stmt.parameter_name(1)?, "foo");
+            assert_eq!(stmt.parameter_name(2)?, "bar");
+
+            assert!(matches!(stmt.parameter_name(0), Err(Error::InvalidParameterIndex(0))));
+            assert!(matches!(
+                stmt.parameter_name(100),
+                Err(Error::InvalidParameterIndex(100))
+            ));
+        }
+
+        // Positional parameters return their index number as the name
+        {
+            let stmt = db.prepare("SELECT ?, ?")?;
+            assert_eq!(stmt.parameter_count(), 2);
+            assert_eq!(stmt.parameter_name(1)?, "1");
+            assert_eq!(stmt.parameter_name(2)?, "2");
+        }
+
+        // Numbered positional parameters also return their number
+        {
+            let stmt = db.prepare("SELECT ?1, ?2")?;
+            assert_eq!(stmt.parameter_count(), 2);
+            assert_eq!(stmt.parameter_name(1)?, "1");
+            assert_eq!(stmt.parameter_name(2)?, "2");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bind_named_parameters_manually() -> Result<()> {
+        use std::collections::HashMap;
+
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("SELECT $foo > $bar")?;
+
+        let mut params: HashMap<String, i32> = HashMap::new();
+        params.insert("foo".to_string(), 42);
+        params.insert("bar".to_string(), 23);
+
+        for idx in 1..=stmt.parameter_count() {
+            let name = stmt.parameter_name(idx)?;
+            if let Some(value) = params.get(&name) {
+                stmt.raw_bind_parameter(idx, value)?;
+            }
+        }
+
+        stmt.raw_execute()?;
+
+        let mut rows = stmt.raw_query();
+        let row = rows.next()?.unwrap();
+        let result: bool = row.get(0)?;
+        assert!(result);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_execute_streaming_error_message() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        // Trigger a conversion error - should fail with a descriptive message
+        let mut stmt = db.prepare("SELECT CAST('not-a-number' AS INTEGER)")?;
+        let result = stmt.stmt.execute_streaming();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        let error_string = format!("{}", err);
+        assert!(
+            error_string.contains("Conversion Error"),
+            "Expected descriptive error, got: {}",
+            error_string
+        );
+
         Ok(())
     }
 }

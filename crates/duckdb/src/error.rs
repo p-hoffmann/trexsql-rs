@@ -80,10 +80,15 @@ pub enum Error {
 
     /// Error when the SQL contains multiple statements.
     MultipleStatement,
+
     /// Error when the number of bound parameters does not match the number of
     /// parameters in the query. The first `usize` is how many parameters were
     /// given, the 2nd is how many were expected.
     InvalidParameterCount(usize, usize),
+
+    /// Error when a parameter is requested, but the index is out of range
+    /// for the statement.
+    InvalidParameterIndex(usize),
 
     /// Append Error
     AppendError,
@@ -108,6 +113,7 @@ impl PartialEq for Error {
             }
             (Self::StatementChangedRows(n1), Self::StatementChangedRows(n2)) => n1 == n2,
             (Self::InvalidParameterCount(i1, n1), Self::InvalidParameterCount(i2, n2)) => i1 == i2 && n1 == n2,
+            (Self::InvalidParameterIndex(i1), Self::InvalidParameterIndex(i2)) => i1 == i2,
             (..) => false,
         }
     }
@@ -187,6 +193,7 @@ impl fmt::Display for Error {
             Self::InvalidParameterCount(i1, n1) => {
                 write!(f, "Wrong number of parameters passed to query. Got {i1}, needed {n1}")
             }
+            Self::InvalidParameterIndex(i) => write!(f, "Invalid parameter index: {i}"),
             Self::StatementChangedRows(i) => write!(f, "Query changed {i} rows"),
             Self::ToSqlConversionFailure(ref err) => err.fmt(f),
             Self::InvalidQuery => write!(f, "Query is not read-only"),
@@ -213,6 +220,7 @@ impl error::Error for Error {
             | Self::InvalidColumnType(..)
             | Self::InvalidPath(_)
             | Self::InvalidParameterCount(..)
+            | Self::InvalidParameterIndex(_)
             | Self::StatementChangedRows(_)
             | Self::InvalidQuery
             | Self::AppendError
@@ -284,5 +292,31 @@ pub fn result_from_duckdb_arrow(code: ffi::duckdb_state, mut out: ffi::duckdb_ar
             message
         };
         error_from_duckdb_code(code, message)
+    }
+}
+
+#[cold]
+#[inline]
+pub fn result_from_duckdb_extract(
+    num_statements: ffi::idx_t,
+    mut extracted: ffi::duckdb_extracted_statements,
+) -> Result<()> {
+    if num_statements > 0 {
+        return Ok(());
+    }
+    unsafe {
+        let message = if extracted.is_null() {
+            Some("extracted statements are null".to_string())
+        } else {
+            let c_err = ffi::duckdb_extract_statements_error(extracted);
+            let message = if c_err.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(c_err).to_string_lossy().to_string())
+            };
+            ffi::duckdb_destroy_extracted(&mut extracted);
+            message
+        };
+        error_from_duckdb_code(ffi::DuckDBError, message)
     }
 }
