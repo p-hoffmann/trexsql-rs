@@ -304,7 +304,7 @@ mod build_linked {
 
             // dependents can access `DEP_TREXSQL_LINK_TARGET` (`trexsql` being the
             // `links=` value in our Cargo.toml) to get this value.
-            println!("cargo:link-target={link_lib}");
+            println!("cargo:link-target={}", link_directive());
         }
 
         if win_target() && cfg!(feature = "winduckdb") {
