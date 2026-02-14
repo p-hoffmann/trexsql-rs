@@ -190,7 +190,7 @@ mod build_bundled {
         if win_target() {
             cfg.define("DUCKDB_BUILD_LIBRARY", None);
         }
-        cfg.compile("duckdb");
+        cfg.compile(lib_name);
 
         println!("cargo:lib_dir={out_dir}");
     }
@@ -218,7 +218,9 @@ impl From<HeaderLocation> for String {
     fn from(header: HeaderLocation) -> Self {
         match header {
             HeaderLocation::FromEnvironment => {
-                let mut header = env::var("DUCKDB_INCLUDE_DIR").unwrap_or_else(|_| env::var("DUCKDB_LIB_DIR").unwrap());
+                let prefix = env_prefix();
+                let mut header = env::var(format!("{prefix}_INCLUDE_DIR"))
+                    .unwrap_or_else(|_| env::var(format!("{prefix}_LIB_DIR")).unwrap());
                 header.push_str(if cfg!(feature = "loadable-extension") {
                     "/duckdb_extension.h"
                 } else {
@@ -254,7 +256,7 @@ mod build_linked {
     #[cfg(feature = "buildtime_bindgen")]
     use super::bindings;
 
-    use super::{is_compiler, win_target, HeaderLocation};
+    use super::{env_prefix, is_compiler, lib_name, win_target, HeaderLocation};
     use std::{
         env, fs, io,
         path::{Path, PathBuf},
@@ -283,51 +285,52 @@ mod build_linked {
         }
     }
 
-    fn link_directive() -> &'static str {
-        // If the user specifies DUCKDB_STATIC, do static
-        // linking, unless it's explicitly set to 0.
-        match env::var("DUCKDB_STATIC") {
-            Ok(v) if v != "0" => "static=duckdb_static",
-            _ => "dylib=duckdb",
+    fn find_link_mode() -> &'static str {
+        match env::var(format!("{}_STATIC", env_prefix())) {
+            Ok(v) if v != "0" => "static",
+            _ => "dylib",
         }
     }
     // Prints the necessary cargo link commands and returns the path to the header.
     fn find_duckdb(out_dir: &str) -> HeaderLocation {
-        println!("cargo:rerun-if-env-changed=DUCKDB_DOWNLOAD_LIB");
+        let prefix = env_prefix();
+        let link_lib = lib_name();
+
+        println!("cargo:rerun-if-env-changed={prefix}_DOWNLOAD_LIB");
         if !cfg!(feature = "loadable-extension") {
-            println!("cargo:rerun-if-env-changed=DUCKDB_INCLUDE_DIR");
-            println!("cargo:rerun-if-env-changed=DUCKDB_LIB_DIR");
-            println!("cargo:rerun-if-env-changed=DUCKDB_STATIC");
+            println!("cargo:rerun-if-env-changed={prefix}_INCLUDE_DIR");
+            println!("cargo:rerun-if-env-changed={prefix}_LIB_DIR");
+            println!("cargo:rerun-if-env-changed={prefix}_STATIC");
             if cfg!(feature = "vcpkg") && is_compiler("msvc") {
                 println!("cargo:rerun-if-env-changed=VCPKGRS_DYNAMIC");
             }
 
             // dependents can access `DEP_TREXSQL_LINK_TARGET` (`trexsql` being the
             // `links=` value in our Cargo.toml) to get this value.
-            println!("cargo:link-target={}", link_directive());
+            println!("cargo:link-target={link_lib}");
         }
 
         if win_target() && cfg!(feature = "winduckdb") {
             if !cfg!(feature = "loadable-extension") {
-                println!("cargo:rustc-link-lib=dylib=duckdb");
+                println!("cargo:rustc-link-lib=dylib={link_lib}");
             }
             return HeaderLocation::Wrapper;
         }
-        // Allow users to specify where to find DuckDB.
-        if let Ok(dir) = env::var("DUCKDB_LIB_DIR") {
+        // Allow users to specify where to find the library.
+        if let Ok(dir) = env::var(format!("{prefix}_LIB_DIR")) {
             println!("cargo:rustc-env=LD_LIBRARY_PATH={dir}");
             // Try to use pkg-config to determine link commands
             let pkgconfig_path = Path::new(&dir).join("pkgconfig");
             env::set_var("PKG_CONFIG_PATH", pkgconfig_path);
 
             #[cfg(feature = "pkg-config")]
-            let lib_found = pkg_config::Config::new().probe("duckdb").is_ok();
+            let lib_found = pkg_config::Config::new().probe(link_lib).is_ok();
             #[cfg(not(feature = "pkg-config"))]
             let lib_found = false;
 
             if !lib_found {
                 // Otherwise just emit the bare minimum link commands.
-                println!("cargo:rustc-link-lib={}", link_directive());
+                println!("cargo:rustc-link-lib={}={}", find_link_mode(), link_lib);
                 println!("cargo:rustc-link-search={dir}");
             }
 
@@ -345,7 +348,7 @@ mod build_linked {
         // See if pkg-config can do everything for us.
         #[cfg(feature = "pkg-config")]
         {
-            match pkg_config::Config::new().print_system_libs(false).probe("duckdb") {
+            match pkg_config::Config::new().print_system_libs(false).probe(link_lib) {
                 Ok(mut lib) => {
                     if let Some(header) = lib.include_paths.pop() {
                         HeaderLocation::FromPath(header.to_string_lossy().into())
@@ -359,7 +362,7 @@ mod build_linked {
                     // output /usr/lib explicitly, but that can introduce other linking problems;
                     // see https://github.com/rusqlite/rusqlite/issues/207.
                     if !cfg!(feature = "loadable-extension") {
-                        println!("cargo:rustc-link-lib={}", link_directive());
+                        println!("cargo:rustc-link-lib={}={}", find_link_mode(), link_lib);
                     }
                     HeaderLocation::Wrapper
                 }
@@ -370,7 +373,7 @@ mod build_linked {
             // No pkg-config available; just output the link-lib request and hope
             // that the library exists on the system paths.
             if !cfg!(feature = "loadable-extension") {
-                println!("cargo:rustc-link-lib={}", link_directive());
+                println!("cargo:rustc-link-lib={}={}", find_link_mode(), link_lib);
             }
             HeaderLocation::Wrapper
         }
@@ -380,7 +383,7 @@ mod build_linked {
         #[cfg(feature = "vcpkg")]
         if is_compiler("msvc") {
             // See if vcpkg can find it.
-            if let Ok(mut lib) = vcpkg::Config::new().probe("duckdb") {
+            if let Ok(mut lib) = vcpkg::Config::new().probe(lib_name()) {
                 if let Some(header) = lib.include_paths.pop() {
                     return Some(HeaderLocation::FromPath(header.to_string_lossy().into()));
                 }
@@ -390,7 +393,7 @@ mod build_linked {
     }
 
     fn should_download_libduckdb() -> bool {
-        env::var("DUCKDB_DOWNLOAD_LIB")
+        env::var(format!("{}_DOWNLOAD_LIB", env_prefix()))
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
             .unwrap_or(false)
     }
@@ -435,7 +438,7 @@ mod build_linked {
     fn configure_link_search(lib_dir: &Path) {
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         if !cfg!(feature = "loadable-extension") {
-            println!("cargo:rustc-link-lib={}", link_directive());
+            println!("cargo:rustc-link-lib={}={}", find_link_mode(), lib_name());
         }
         if !win_target() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
