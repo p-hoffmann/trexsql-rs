@@ -138,6 +138,14 @@ mod build_bundled {
         cfg.define("DUCKDB_EXTENSION_AUTOINSTALL_DEFAULT", "1");
         cfg.define("DUCKDB_EXTENSION_AUTOLOAD_DEFAULT", "1");
 
+        // Override version to match the official v1.4.4 release so that
+        // pre-installed extensions in /root/.duckdb/extensions/v1.4.4/ are found.
+        cfg.define("DUCKDB_MAJOR_VERSION", "1");
+        cfg.define("DUCKDB_MINOR_VERSION", "4");
+        cfg.define("DUCKDB_PATCH_VERSION", "\"4\"");
+        cfg.define("DUCKDB_VERSION", "\"v1.4.4\"");
+        cfg.define("DUCKDB_SOURCE_ID", "\"1f98600c2c\"");
+
         // Since the manifest controls the set of files, we require it to be changed to know whether
         // to rebuild the project
         println!("cargo:rerun-if-changed={out_dir}/{bundled_dir}/manifest.json");
