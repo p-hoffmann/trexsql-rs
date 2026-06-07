@@ -212,6 +212,7 @@ fn lib_name() -> &'static str {
     "trexsql"
 }
 
+#[allow(dead_code)]
 fn bundled_dir_name() -> &'static str {
     "duckdb"
 }
