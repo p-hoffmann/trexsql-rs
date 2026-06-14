@@ -285,6 +285,19 @@ impl Connection {
         })
     }
 
+    /// The raw `duckdb_database` handle this connection belongs to.
+    ///
+    /// Lets a host (e.g. a DuckDB loadable extension) hand its database instance
+    /// to another consumer of the same in-process DuckDB library — via
+    /// [`Connection::open_from_raw`] — so both share one catalog (attached
+    /// databases, cache files, …) instead of opening separate instances. The
+    /// handle is borrowed: the caller must keep this `Connection` (or the
+    /// database) alive while the handle is in use, and must not close it.
+    #[inline]
+    pub fn raw_database(&self) -> ffi::duckdb_database {
+        self.db.borrow().raw_database()
+    }
+
     /// Open a new connection to a DuckDB database.
     ///
     /// # Failure

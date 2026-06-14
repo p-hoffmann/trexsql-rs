@@ -103,6 +103,14 @@ impl InnerConnection {
         Self::new(Arc::new(Mutex::new(DatabaseHandle::new(raw, close_on_drop))))
     }
 
+    /// The raw `duckdb_database` this connection belongs to. Lets a host (e.g. a
+    /// loadable extension) share its instance with another consumer of the same
+    /// in-process DuckDB library instead of opening a separate database.
+    #[inline]
+    pub fn raw_database(&self) -> ffi::duckdb_database {
+        self.database.lock().expect("database handle mutex poisoned").raw()
+    }
+
     pub fn close(&mut self) -> Result<()> {
         if self.con.is_null() {
             return Ok(());
