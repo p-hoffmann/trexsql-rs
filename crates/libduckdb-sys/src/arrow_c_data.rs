@@ -123,9 +123,8 @@ mod tests {
         ffi_stream::FFI_ArrowArrayStream,
     };
 
-    // arrow-rs keeps the FFI fields private, so compare layouts by reading a
-    // populated arrow-rs struct through ours and checking every field against
-    // arrow-rs's accessors.
+    // Compare layouts by reading a populated arrow-rs struct through ours and
+    // checking every field against arrow-rs's (arrow 59: public fields).
     #[test]
     fn matches_arrow_rs_array_layout() {
         assert_eq!(size_of::<ArrowArray>(), size_of::<FFI_ArrowArray>());
@@ -143,8 +142,8 @@ mod tests {
         for i in 0..ffi.num_buffers() {
             assert_eq!(unsafe { *ours.buffers.add(i) } as *const u8, ffi.buffer(i));
         }
-        assert_eq!(ours.release.map(|f| f as usize), ffi.release().map(|f| f as usize));
-        assert_eq!(ours.private_data, ffi.private_data());
+        assert_eq!(ours.release.map(|f| f as usize), ffi.release.map(|f| f as usize));
+        assert_eq!(ours.private_data, ffi.private_data);
 
         let dict: DictionaryArray<Int8Type> = ["a", "b", "a"].into_iter().collect();
         let nested = StructArray::from(vec![(
@@ -186,8 +185,8 @@ mod tests {
 
         let dictionary = ffi.child(0).dictionary().unwrap();
         assert!(ptr::eq(child.dictionary as *const FFI_ArrowSchema, dictionary));
-        assert_eq!(ours.release.map(|f| f as usize), ffi.release().map(|f| f as usize));
-        assert_eq!(ours.private_data, ffi.private_data());
+        assert_eq!(ours.release.map(|f| f as usize), ffi.release.map(|f| f as usize));
+        assert_eq!(ours.private_data, ffi.private_data);
     }
 
     // Drives an arrow-rs stream through our callback fields, so a misplaced field calls the wrong function.
@@ -200,8 +199,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
         let batches = vec![Ok(batch), Err(ArrowError::ComputeError("boom".into()))];
         let mut ffi = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(batches, schema.clone())));
-        let release = ffi.release().map(|f| f as usize);
-        let private_data = ffi.private_data();
+        let release = ffi.release.map(|f| f as usize);
+        let private_data = ffi.private_data;
 
         let ours = &mut ffi as *mut FFI_ArrowArrayStream as *mut ArrowArrayStream;
         unsafe {

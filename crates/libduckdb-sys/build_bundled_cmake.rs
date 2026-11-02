@@ -76,7 +76,10 @@ pub fn main(out_dir: &str) {
         .define("CMAKE_C_FLAGS_INIT", init_flags())
         .define("CMAKE_CXX_FLAGS_INIT", init_flags());
     // trex: always set so the CMake cache never keeps a stale key list.
-    config.define("DUCKDB_CUSTOM_SIGNING_KEYS", env_var("DUCKDB_CUSTOM_SIGNING_KEYS").unwrap_or_default());
+    config.define(
+        "DUCKDB_CUSTOM_SIGNING_KEYS",
+        env_var("DUCKDB_CUSTOM_SIGNING_KEYS").unwrap_or_default(),
+    );
 
     // Re-enable C++ exceptions on MSVC. The cmake crate makes its `cxxflag`s the
     // source of -DCMAKE_CXX_FLAGS, replacing CMake's default (which includes /EHsc),

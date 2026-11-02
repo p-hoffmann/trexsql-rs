@@ -110,6 +110,7 @@ jobs:
           TREXSQL_LIB_DIR: ${{ github.workspace }}/libtrexsql
           TREXSQL_INCLUDE_DIR: ${{ github.workspace }}/libtrexsql
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtrexsql
+          TREX_EXTENSIONS: none
         run: cargo test --features "modern-full vtab-full vtab-loadable"
 
       - name: Build loadable extension

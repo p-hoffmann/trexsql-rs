@@ -146,7 +146,8 @@ fn try_download(out_dir: &str) -> Option<HeaderLocation> {
 
 #[cfg(not(feature = "download-lib"))]
 fn try_download(_out_dir: &str) -> Option<HeaderLocation> {
-    if env::var(env_name("DOWNLOAD_LIB")).is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true")) {
+    if env::var(env_name("DOWNLOAD_LIB")).is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
+    {
         panic!(
             "TREXSQL_DOWNLOAD_LIB is set, but libduckdb-sys was built without the `download-lib` feature. \
              Enable it (`--features download-lib`) to download a pre-built libduckdb, \

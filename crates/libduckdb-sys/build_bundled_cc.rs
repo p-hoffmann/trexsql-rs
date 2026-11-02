@@ -191,8 +191,9 @@ fn write_custom_signing_keys(out_dir: &str) -> std::path::PathBuf {
         Err(_) => String::new(),
     };
     let path = Path::new(out_dir).join("custom_signing_keys.cpp");
-    let content =
-        format!("namespace duckdb {{\nextern const char *const custom_public_keys[] = {{\n{keys}nullptr}};\n}} // namespace duckdb\n");
+    let content = format!(
+        "namespace duckdb {{\nextern const char *const custom_public_keys[] = {{\n{keys}nullptr}};\n}} // namespace duckdb\n"
+    );
     std::fs::write(&path, content).expect("Failed to write custom_signing_keys.cpp");
     path
 }
