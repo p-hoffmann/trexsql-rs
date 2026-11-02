@@ -1,26 +1,45 @@
-use super::{ffi, AppenderParams, Connection, Result, ValueRef};
+use super::{AppenderParams, Connection, Result, ValueRef, ffi};
 use std::{ffi::c_void, fmt, os::raw::c_char};
 
 use crate::{
-    error::result_from_duckdb_appender,
-    types::{ToSql, ToSqlOutput},
     Error,
+    error::{error_from_appender_code, result_from_duckdb_appender},
+    types::{
+        OwnedDuckValue, ToSql, ToSqlOutput, create_owned_container, is_owned_container, to_duckdb_hugeint,
+        to_duckdb_uhugeint, value_ref_from_value,
+    },
 };
 
 /// Appender for fast import data
 ///
+/// # Error Reporting
+///
+/// DuckDB buffers appended rows and checks constraints (`NOT NULL`, foreign
+/// keys, ...) when the buffered data is flushed to the table. That can happen
+/// through an explicit [`flush`](Appender::flush), through DuckDB's internal
+/// appender flush while appending many rows, or when the appender is dropped.
+/// As a result, [`append_row`](Appender::append_row) may return `Ok` for a row
+/// that later fails a constraint check.
+///
+/// Always call `flush` explicitly and check its result before dropping the
+/// appender. Dropping an appender flushes any remaining rows, but errors
+/// raised during that implicit flush are discarded because `Drop` cannot
+/// report them.
+///
 /// # Thread Safety
 ///
-/// `Appender` is neither `Send` nor `Sync`:
-/// - Not `Send` because it holds a reference to `Connection`, which is `!Sync`
-/// - Not `Sync` because DuckDB appenders don't support concurrent access
+/// `Appender` is `Sync` but not `Send`:
+/// - `Sync` because every method that touches the underlying DuckDB appender
+///   takes `&mut self`, so no mutation is reachable through a shared
+///   `&Appender`. This is in the spirit of [`std::sync::Exclusive`].
+/// - Not `Send` because it holds a reference to `Connection`, which is `!Sync`.
 ///
 /// To use an appender in another thread, move the `Connection` to that thread
 /// and create the appender there.
 ///
-/// If you need to share an `Appender` across threads, wrap it in a `Mutex`.
-///
 /// See [DuckDB concurrency documentation](https://duckdb.org/docs/stable/connect/concurrency.html) for more details.
+///
+/// [`std::sync::Exclusive`]: https://doc.rust-lang.org/std/sync/struct.Exclusive.html
 ///
 /// # Wide Tables (Many Columns)
 ///
@@ -61,6 +80,15 @@ pub struct Appender<'conn> {
     app: ffi::duckdb_appender,
 }
 
+// SAFETY: every method that touches the appender pointer takes `&mut self`.
+// The only shared access exposed by the public API (the `Debug` impl) reads
+// `Connection`'s immutable `path` field without touching the appender pointer
+// or the connection's `RefCell`. No mutation is reachable through a shared
+// `&Appender`, so sharing one across threads is sound. This is in the spirit
+// of `std::sync::Exclusive`, with an additional read-only `Debug` view. `Send`
+// stays disallowed because `&Connection: !Send` (`Connection` is `!Sync`).
+unsafe impl Sync for Appender<'_> {}
+
 #[cfg(feature = "appender-arrow")]
 mod arrow;
 
@@ -80,7 +108,7 @@ impl Appender<'_> {
     ///
     /// # Failure
     ///
-    /// Will return `Err` if append column count not the same with the table schema
+    /// Returns `Err` if a row cannot be appended.
     #[inline]
     pub fn append_rows<P, I>(&mut self, rows: I) -> Result<()>
     where
@@ -108,38 +136,90 @@ impl Appender<'_> {
     ///
     /// # Failure
     ///
-    /// Will return `Err` if append column count not the same with the table schema
+    /// Returns `Err` if the row cannot be appended.
     #[inline]
     pub fn append_row<P: AppenderParams>(&mut self, params: P) -> Result<()> {
-        let _ = unsafe { ffi::duckdb_appender_begin_row(self.app) };
-        params.__bind_in(self)?;
-        // NOTE: we only check end_row return value
-        let rc = unsafe { ffi::duckdb_appender_end_row(self.app) };
-        result_from_duckdb_appender(rc, &mut self.app)
+        // AppenderParams normalizes arrays, tuples, slices, and iterators into
+        // append_parameter_row, which validates up-front, then ends the row
+        // after binding.
+        params.__bind_in(self)
     }
 
     #[inline]
-    pub(crate) fn bind_parameters<P>(&mut self, params: P) -> Result<()>
+    pub(crate) fn append_parameter_row<P>(&mut self, params: P) -> Result<()>
     where
         P: IntoIterator,
         P::Item: ToSql,
     {
-        for p in params.into_iter() {
-            self.bind_parameter(&p)?;
+        let params = params.into_iter().collect::<Vec<_>>();
+        let values = params
+            .iter()
+            .map(ToSql::to_sql)
+            .collect::<Result<Vec<ToSqlOutput<'_>>>>()?;
+
+        let containers = self.prepare_owned_containers(&values)?;
+
+        if let Err(err) = self.bind_parameter_values(&values, containers) {
+            // A failed bind can leave DuckDB with a partial row. End the row
+            // only to let DuckDB mark the appender invalid, then preserve the
+            // original bind error; the cleanup failure is usually less useful.
+            if !self.app.is_null() {
+                let rc = unsafe { ffi::duckdb_appender_end_row(self.app) };
+                if rc != ffi::DuckDBSuccess {
+                    unsafe {
+                        ffi::duckdb_appender_destroy(&mut self.app);
+                    }
+                }
+            }
+            return Err(err);
+        }
+        let rc = unsafe { ffi::duckdb_appender_end_row(self.app) };
+        result_from_duckdb_appender(rc, &mut self.app)
+    }
+
+    /// Build every owned container before the appender writes a column.
+    ///
+    /// A duplicate map key fails inside this build. No column of the row has
+    /// been appended, so the caller does not end the row and does not destroy
+    /// the appender. The returned value is the one `bind_parameter` appends.
+    fn prepare_owned_containers(&self, values: &[ToSqlOutput<'_>]) -> Result<Vec<Option<OwnedDuckValue>>> {
+        let mut built = Vec::with_capacity(values.len());
+        for value in values {
+            if let ToSqlOutput::Owned(owned) = value
+                && is_owned_container(owned)
+            {
+                built.push(Some(create_owned_container(owned)?));
+                continue;
+            }
+            let value = to_value_ref(value)?;
+            validate_appender_value_ref(value)?;
+            built.push(None);
+        }
+        Ok(built)
+    }
+
+    fn bind_parameter_values(
+        &mut self,
+        values: &[ToSqlOutput<'_>],
+        containers: Vec<Option<OwnedDuckValue>>,
+    ) -> Result<()> {
+        for (value, container) in values.iter().zip(containers) {
+            self.bind_parameter(value, container)?;
         }
         Ok(())
     }
 
-    fn bind_parameter<P: ?Sized + ToSql>(&self, param: &P) -> Result<()> {
-        let value = param.to_sql()?;
-
+    fn bind_parameter(&mut self, value: &ToSqlOutput<'_>, container: Option<OwnedDuckValue>) -> Result<()> {
         let ptr = self.app;
-        let value = match value {
-            ToSqlOutput::Borrowed(v) => v,
-            ToSqlOutput::Owned(ref v) => ValueRef::from(v),
-        };
-        // NOTE: we ignore the return value here
-        //       because if anything failed, end_row will fail
+        if let Some(duck_value) = container {
+            let rc = unsafe { ffi::duckdb_append_value(ptr, duck_value.as_raw()) };
+            drop(duck_value);
+            if rc != 0 {
+                return Err(error_from_appender_code(rc, self.app));
+            }
+            return Ok(());
+        }
+        let value = to_value_ref(value)?;
         // TODO: append more
         let rc = match value {
             ValueRef::Null => unsafe { ffi::duckdb_append_null(ptr) },
@@ -152,13 +232,8 @@ impl Appender<'_> {
             ValueRef::USmallInt(i) => unsafe { ffi::duckdb_append_uint16(ptr, i) },
             ValueRef::UInt(i) => unsafe { ffi::duckdb_append_uint32(ptr, i) },
             ValueRef::UBigInt(i) => unsafe { ffi::duckdb_append_uint64(ptr, i) },
-            ValueRef::HugeInt(i) => unsafe {
-                let hi = ffi::duckdb_hugeint {
-                    lower: i as u64,
-                    upper: (i >> 64) as i64,
-                };
-                ffi::duckdb_append_hugeint(ptr, hi)
-            },
+            ValueRef::HugeInt(i) => unsafe { ffi::duckdb_append_hugeint(ptr, to_duckdb_hugeint(i)) },
+            ValueRef::UHugeInt(i) => unsafe { ffi::duckdb_append_uhugeint(ptr, to_duckdb_uhugeint(i)) },
 
             ValueRef::Float(r) => unsafe { ffi::duckdb_append_float(ptr, r) },
             ValueRef::Double(r) => unsafe { ffi::duckdb_append_double(ptr, r) },
@@ -168,7 +243,9 @@ impl Appender<'_> {
             ValueRef::Timestamp(u, i) => unsafe {
                 ffi::duckdb_append_timestamp(ptr, ffi::duckdb_timestamp { micros: u.to_micros(i) })
             },
-            ValueRef::Blob(b) => unsafe { ffi::duckdb_append_blob(ptr, b.as_ptr() as *const c_void, b.len() as u64) },
+            ValueRef::Blob(b) | ValueRef::Geometry(b) => unsafe {
+                ffi::duckdb_append_blob(ptr, b.as_ptr() as *const c_void, b.len() as u64)
+            },
             ValueRef::Date32(d) => unsafe { ffi::duckdb_append_date(ptr, ffi::duckdb_date { days: d }) },
             ValueRef::Time64(u, v) => unsafe {
                 ffi::duckdb_append_time(ptr, ffi::duckdb_time { micros: u.to_micros(v) })
@@ -183,10 +260,18 @@ impl Appender<'_> {
                     },
                 )
             },
-            _ => unreachable!("not supported"),
+            ValueRef::Decimal(d) => unsafe {
+                let decimal = crate::types::to_duckdb_decimal(d);
+                append_decimal(ptr, decimal)?
+            },
+            _ => {
+                return Err(Error::ToSqlConversionFailure(
+                    appending_unsupported_value(value.data_type()).into(),
+                ));
+            }
         };
         if rc != 0 {
-            return Err(Error::AppendError);
+            return Err(error_from_appender_code(rc, self.app));
         }
         Ok(())
     }
@@ -196,7 +281,20 @@ impl Appender<'_> {
         Appender { conn, app }
     }
 
-    /// Flush data into DB
+    /// Flush buffered rows into the table.
+    ///
+    /// Constraint violations (e.g. `NOT NULL`) in previously appended rows are
+    /// reported when buffered rows are flushed. This method is the explicit way
+    /// to observe those errors, although DuckDB may also surface them from an
+    /// internal appender flush during append. Call this explicitly and check the
+    /// result before dropping the appender: the implicit flush on drop discards
+    /// any error.
+    ///
+    /// # Failure
+    ///
+    /// Returns `Err` if the buffered rows cannot be written, e.g. because a
+    /// row violates a table constraint. The appender is invalidated and the
+    /// buffered rows are lost.
     #[inline]
     pub fn flush(&mut self) -> Result<()> {
         unsafe {
@@ -247,9 +345,76 @@ impl fmt::Debug for Appender<'_> {
     }
 }
 
+fn appending_unsupported_value(value_type: impl fmt::Display) -> String {
+    format!("appending {value_type} values is not yet supported")
+}
+
+unsafe fn append_decimal(ptr: ffi::duckdb_appender, decimal: ffi::duckdb_decimal) -> Result<ffi::duckdb_state> {
+    let mut value = unsafe { ffi::duckdb_create_decimal(decimal) };
+    if value.is_null() {
+        return Err(Error::AppendError);
+    }
+    let res = unsafe { ffi::duckdb_append_value(ptr, value) };
+    unsafe {
+        ffi::duckdb_destroy_value(&mut value);
+    }
+    Ok(res)
+}
+
+fn to_value_ref<'value, 'output>(value: &'value ToSqlOutput<'output>) -> Result<ValueRef<'value>>
+where
+    'output: 'value,
+{
+    match *value {
+        ToSqlOutput::Borrowed(v) => Ok(v),
+        ToSqlOutput::Owned(ref v) => value_ref_from_value(v, appending_unsupported_value),
+    }
+}
+
+fn validate_appender_value_ref(value: ValueRef<'_>) -> Result<()> {
+    match value {
+        ValueRef::Null
+        | ValueRef::Boolean(_)
+        | ValueRef::TinyInt(_)
+        | ValueRef::SmallInt(_)
+        | ValueRef::Int(_)
+        | ValueRef::BigInt(_)
+        | ValueRef::HugeInt(_)
+        | ValueRef::UHugeInt(_)
+        | ValueRef::UTinyInt(_)
+        | ValueRef::USmallInt(_)
+        | ValueRef::UInt(_)
+        | ValueRef::UBigInt(_)
+        | ValueRef::Float(_)
+        | ValueRef::Double(_)
+        | ValueRef::Text(_)
+        | ValueRef::Timestamp(_, _)
+        | ValueRef::Blob(_)
+        | ValueRef::Geometry(_)
+        | ValueRef::Date32(_)
+        | ValueRef::Time64(_, _)
+        | ValueRef::Interval { .. }
+        | ValueRef::Decimal(_) => Ok(()),
+        _ => Err(Error::ToSqlConversionFailure(
+            appending_unsupported_value(value.data_type()).into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::{params, Connection, Error, Result};
+    use super::Appender;
+    use crate::{
+        Connection, Error, Result, params,
+        types::{Decimal, OrderedMap, Value},
+    };
+
+    #[test]
+    fn appender_is_sync() {
+        fn assert_sync<T: Sync>() {}
+
+        assert_sync::<Appender<'_>>();
+    }
 
     #[test]
     fn test_append_one_row() -> Result<()> {
@@ -267,6 +432,259 @@ mod test {
     }
 
     #[test]
+    fn test_append_geometry_value_as_wkb_blob() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(wkb BLOB)")?;
+
+        let wkb: Vec<u8> = db.query_row("SELECT ST_AsWKB('POINT EMPTY'::GEOMETRY)", [], |row| row.get(0))?;
+        let mut app = db.appender("foo")?;
+        app.append_row([Value::Geometry(wkb.clone())])?;
+        app.flush()?;
+
+        let got: Vec<u8> = db.query_row("SELECT wkb FROM foo", [], |row| row.get(0))?;
+        assert_eq!(got, wkb);
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_geometry_value_to_geometry_column() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(geom GEOMETRY)")?;
+
+        let wkb: Vec<u8> = db.query_row("SELECT ST_AsWKB('POINT EMPTY'::GEOMETRY)", [], |row| row.get(0))?;
+        let mut app = db.appender("foo")?;
+        app.append_row([Value::Geometry(wkb.clone())])?;
+        app.flush()?;
+
+        let got: Value = db.query_row("SELECT geom FROM foo", [], |row| row.get(0))?;
+        assert_eq!(got, Value::Geometry(wkb));
+        Ok(())
+    }
+
+    #[test]
+    fn test_appender_variant_columns_delegate_to_duckdb() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, variant_col VARIANT)")?;
+
+        let mut app = db.appender("foo")?;
+        app.append_row(params![1, "hello"])?;
+        app.flush()?;
+
+        let mut app = db.appender_with_columns("foo", &["variant_col"])?;
+        app.append_row(params!["column_subset"])?;
+        app.flush()?;
+
+        let mut app = db.appender_with_columns("foo", &["id"])?;
+        app.add_column("variant_col")?;
+        app.append_row(params![3, "added_column"])?;
+        app.flush()?;
+
+        let mut app = db.appender_with_columns("foo", &["id"])?;
+        app.clear_columns()?;
+        app.append_row(params![4, "cleared_columns"])?;
+        app.flush()?;
+
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM foo WHERE variant_col IS NOT NULL", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_unsupported_container_type_returns_error() -> Result<()> {
+        use arrow::{array::ListArray, datatypes::Int32Type};
+
+        use crate::{
+            ToSql,
+            types::{ListType, ToSqlOutput, ValueRef},
+        };
+
+        struct BorrowedList(ListArray);
+        impl BorrowedList {
+            fn new() -> Self {
+                Self(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                ])]))
+            }
+        }
+        impl ToSql for BorrowedList {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::Borrowed(ValueRef::List(ListType::Regular(&self.0), 0)))
+            }
+        }
+
+        fn assert_unsupported_list_error(err: Error) {
+            match err {
+                Error::ToSqlConversionFailure(e) => {
+                    assert!(
+                        e.to_string().contains("appending List values is not yet supported"),
+                        "unexpected message: {e}"
+                    );
+                }
+                other => panic!("expected ToSqlConversionFailure, got {other:?}"),
+            }
+        }
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, name TEXT)")?;
+
+        let mut app = db.appender("foo")?;
+        app.append_row(params![10, "before"])?;
+        app.append_row(params![11, "also before"])?;
+        let err = app.append_row(params![3, BorrowedList::new()]).unwrap_err();
+        assert_unsupported_list_error(err);
+        app.append_row(params![2, "ok"])?;
+        app.flush()?;
+
+        let rows = db
+            .prepare("SELECT id, name FROM foo ORDER BY id")?
+            .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (2, "ok".to_string()),
+                (10, "before".to_string()),
+                (11, "also before".to_string())
+            ]
+        );
+        let count: i32 = db.query_row("SELECT COUNT(*) FROM foo", [], |row| row.get(0))?;
+        assert_eq!(count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_owned_list() -> Result<()> {
+        use crate::{
+            ToSql,
+            types::{ToSqlOutput, Value},
+        };
+
+        struct OwnedList;
+        impl ToSql for OwnedList {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::Owned(Value::List(vec![Value::Int(1), Value::Int(2)])))
+            }
+        }
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, numbers INTEGER[])")?;
+
+        let mut app = db.appender("foo")?;
+        app.append_row(params![1, OwnedList])?;
+        app.append_row(params![3, Value::List(vec![Value::Int(3)])])?;
+        app.flush()?;
+
+        let rows = db
+            .prepare("SELECT id, numbers FROM foo ORDER BY id")?
+            .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, Value>(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (1, Value::List(vec![Value::Int(1), Value::Int(2)])),
+                (3, Value::List(vec![Value::Int(3)])),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_duplicate_map_key_keeps_appender() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, payload MAP(INTEGER, INTEGER))")?;
+
+        let mut app = db.appender("foo")?;
+        app.append_row(params![
+            1,
+            Value::Map(OrderedMap::from(vec![(Value::Int(1), Value::Int(2))]))
+        ])?;
+        let err = app
+            .append_row(params![
+                2,
+                Value::Map(OrderedMap::from(vec![
+                    (Value::Int(1), Value::Int(2)),
+                    (Value::Int(1), Value::Int(3)),
+                ]))
+            ])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DuckDB rejected the Map value"),
+            "unexpected message: {err}"
+        );
+        assert!(!app.app.is_null());
+        app.append_row(params![
+            3,
+            Value::Map(OrderedMap::from(vec![(Value::Int(4), Value::Int(5))]))
+        ])?;
+        app.flush()?;
+
+        let rows = db
+            .prepare("SELECT id FROM foo ORDER BY id")?
+            .query_map([], |row| row.get::<_, i32>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(rows, vec![1, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_mixed_list_fails_before_row_starts() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, name TEXT)")?;
+
+        let mut app = db.appender("foo")?;
+        app.append_row(params![10, "before"])?;
+        let err = app
+            .append_row(params![
+                1,
+                Value::List(vec![Value::Int(1), Value::Text("a".to_string())])
+            ])
+            .unwrap_err();
+        match err {
+            Error::ToSqlConversionFailure(e) => {
+                assert!(
+                    e.to_string().contains("cannot bind List with mixed element types"),
+                    "unexpected message: {e}"
+                );
+            }
+            other => panic!("expected ToSqlConversionFailure, got {other:?}"),
+        }
+        assert!(!app.app.is_null());
+        app.append_row(params![2, "ok"])?;
+        app.flush()?;
+
+        let rows = db
+            .prepare("SELECT id, name FROM foo ORDER BY id")?
+            .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(rows, vec![(2, "ok".to_string()), (10, "before".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_bind_failure_preserves_bind_error() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER, value UUID)")?;
+
+        let mut app = db.appender("foo")?;
+        let err = app.append_row(params![1, 2]).unwrap_err();
+
+        match err {
+            Error::DuckDBFailure(_, Some(msg)) => {
+                assert_eq!(
+                    msg,
+                    "Failed to cast value: Unimplemented type for cast (INTEGER -> UUID)"
+                );
+            }
+            other => panic!("expected DuckDBFailure from appender bind, got {other:?}"),
+        }
+        assert!(app.app.is_null());
+        Ok(())
+    }
+
+    #[test]
     fn test_append_rows() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch("CREATE TABLE foo(x INTEGER, y INTEGER)")?;
@@ -278,6 +696,26 @@ mod test {
 
         let val = db.query_row("SELECT sum(x), sum(y) FROM foo", [], |row| <(i32, i32)>::try_from(row))?;
         assert_eq!(val, (25, 30));
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_u128_as_uhugeint() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute("CREATE TABLE t(v UHUGEINT)", [])?;
+
+        let mut appender = db.appender("t")?;
+        appender.append_row([0u128])?;
+        appender.append_row([u128::MAX])?;
+        drop(appender);
+
+        let values: Vec<u128> = db
+            .prepare("SELECT v FROM t ORDER BY v")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(values, vec![0, u128::MAX]);
+
         Ok(())
     }
 
@@ -553,6 +991,104 @@ mod test {
 
         let (a, b): (i32, i32) = db.query_row("SELECT a, b FROM s.bar", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
         assert_eq!((a, b), (11, 9));
+        Ok(())
+    }
+
+    #[test]
+    fn test_appender_decimal() -> Result<()> {
+        let d1 = Decimal::new(20, 4, 11344)?;
+        let d2 = Decimal::new(20, 3, 12312)?;
+        let d3 = Decimal::new(20, 5, -98765)?;
+
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE decimals (value DECIMAL(20, 10));")?;
+
+        let mut appender = conn.appender("decimals")?;
+        appender.append_row(params![d1])?;
+        appender.append_row(params![d2])?;
+        appender.append_row(params![d3])?;
+        appender.flush()?;
+
+        let results: Vec<Decimal> = conn
+            .prepare("SELECT value FROM decimals ORDER BY value ASC")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<Decimal>>>()?;
+
+        assert_eq!(
+            results,
+            vec![
+                Decimal::new(20, 10, -9876500000)?,
+                Decimal::new(20, 10, 11344000000)?,
+                Decimal::new(20, 10, 123120000000)?,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_appender_decimal_hugeint_upper_bits() -> Result<()> {
+        let negative = Decimal::new(28, 10, -7922816251426433759354395033_i128)?;
+        let positive = Decimal::new(28, 10, 7922816251426433759354395033_i128)?;
+
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE decimals (value DECIMAL(28, 10));")?;
+
+        let mut appender = conn.appender("decimals")?;
+        appender.append_row(params![negative])?;
+        appender.append_row(params![positive])?;
+        appender.flush()?;
+
+        let results: Vec<Decimal> = conn
+            .prepare("SELECT value FROM decimals ORDER BY value ASC")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<Decimal>>>()?;
+
+        assert_eq!(results, vec![negative, positive]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_appender_decimal_boundary_values() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE decimals (value DECIMAL(29, 0));")?;
+
+        let zero = Decimal::new(29, 0, 0)?;
+        let max = Decimal::new(29, 0, 79_228_162_514_264_337_593_543_950_335)?;
+
+        let mut appender = conn.appender("decimals")?;
+        appender.append_row(params![zero])?;
+        appender.append_row(params![max])?;
+        appender.flush()?;
+
+        let results: Vec<Decimal> = conn
+            .prepare("SELECT value FROM decimals ORDER BY value ASC")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<Decimal>>>()?;
+
+        assert_eq!(results, vec![zero, max]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_appender_native_decimal() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE decimals (value DECIMAL(38, 2));")?;
+
+        let direct = Decimal::new(38, 2, 12_345_678_901_234_567_890_123_456_789_012)?;
+        let owned = Decimal::new(38, 2, -12_345_678_901_234_567_890_123_456_789_012)?;
+
+        let mut appender = conn.appender("decimals")?;
+        appender.append_row(params![direct])?;
+        appender.append_row(params![Value::Decimal(owned)])?;
+        appender.flush()?;
+
+        let results: Vec<Decimal> = conn
+            .prepare("SELECT value FROM decimals ORDER BY value ASC")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<Decimal>>>()?;
+
+        assert_eq!(results, vec![owned, direct]);
         Ok(())
     }
 }

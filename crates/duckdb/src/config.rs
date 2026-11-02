@@ -1,4 +1,4 @@
-use super::{ffi, Result};
+use super::{Result, ffi};
 use crate::error::Error;
 use std::{default::Default, ffi::CString, os::raw::c_char, ptr};
 
@@ -60,7 +60,7 @@ impl Config {
         Ok(self)
     }
 
-    /// Access mode of the database ([AUTOMATIC], READ_ONLY or READ_WRITE)
+    /// Access mode of the database (`AUTOMATIC`, `READ_ONLY` or `READ_WRITE`)
     pub fn access_mode(mut self, mode: AccessMode) -> Result<Self> {
         self.set("access_mode", mode)?;
         Ok(self)
@@ -72,13 +72,13 @@ impl Config {
         Ok(self)
     }
 
-    /// The order type used when none is specified ([ASC] or DESC)
+    /// The order type used when none is specified (`ASC` or `DESC`)
     pub fn default_order(mut self, order: DefaultOrder) -> Result<Self> {
         self.set("default_order", order)?;
         Ok(self)
     }
 
-    /// Null ordering used when none is specified ([NULLS_FIRST] or NULLS_LAST)
+    /// Null ordering used when none is specified (`NULLS_FIRST` or `NULLS_LAST`)
     pub fn default_null_order(mut self, null_order: DefaultNullOrder) -> Result<Self> {
         self.set("default_null_order", null_order)?;
         Ok(self)
@@ -126,11 +126,16 @@ impl Config {
         if self.config.is_none() {
             let mut config: ffi::duckdb_config = ptr::null_mut();
             let state = unsafe { ffi::duckdb_create_config(&mut config) };
-            assert_eq!(state, ffi::DuckDBSuccess);
+            if state != ffi::DuckDBSuccess {
+                return Err(Error::DuckDBFailure(
+                    ffi::Error::new(state),
+                    Some("failed to create config".to_string()),
+                ));
+            }
             self.config = Some(config);
         }
-        let c_key = CString::new(key).unwrap();
-        let c_value = CString::new(value).unwrap();
+        let c_key = CString::new(key)?;
+        let c_value = CString::new(value)?;
         let state = unsafe {
             ffi::duckdb_set_config(
                 self.config.unwrap(),
@@ -158,7 +163,7 @@ impl Drop for Config {
 
 #[cfg(test)]
 mod test {
-    use crate::{types::Value, Config, Connection, Result};
+    use crate::{Config, Connection, Result, types::Value};
 
     #[test]
     fn test_default_config() -> Result<()> {
@@ -229,6 +234,12 @@ mod test {
         assert!(&user_agent.ends_with("rust test_user_agent"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_null_byte_in_key_returns_error() {
+        let err = Config::default().with("key\0name", "value");
+        assert!(err.is_err(), "expected Config::set to return Err for null byte in key");
     }
 
     #[test]

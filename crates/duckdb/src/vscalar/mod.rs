@@ -1,17 +1,41 @@
-use std::ffi::CString;
+//! Registered scalar functions implemented in Rust.
+//!
+//! DuckDB invokes these functions through C callbacks. A Rust panic must not
+//! unwind through that interface: without containment, a faulty function can
+//! abort the host process instead of failing its query. The registration
+//! helpers in this module therefore convert callback panics and ordinary
+//! errors into DuckDB query errors. They also contain failures while formatting
+//! errors or destroying registered state, allowing later queries to keep using
+//! the connection.
+//!
+//! These guarantees apply to functions registered through
+//! [`Connection::register_scalar_function`] or
+//! [`Connection::register_scalar_function_with_state`]. A panic can poison or
+//! otherwise damage interior mutable [`VScalar::State`](crate::vscalar::VScalar::State),
+//! which is reused by later invocations, so implementations must preserve or
+//! restore its invariants during unwinding. Panics from state destruction are
+//! contained and logged to standard error because DuckDB's destructor callback
+//! cannot return an error. The panic hook runs before containment and may also
+//! write to standard error; applications can customize it with
+//! [`std::panic::set_hook`]. These guarantees require unwinding; a
+//! `panic = "abort"` build aborts first.
 
-use function::{ScalarFunction, ScalarFunctionSet};
-use libduckdb_sys::{
+use libduckdb_sys::v1::{
     duckdb_data_chunk, duckdb_function_info, duckdb_scalar_function_get_extra_info, duckdb_scalar_function_set_error,
     duckdb_vector,
 };
+use std::ffi::CStr;
 
 use crate::{
+    Connection,
+    arrow_interop::WritableVector,
+    callback::{CallbackErrorSink, contain_callback},
     core::{DataChunkHandle, LogicalTypeHandle},
     inner_connection::InnerConnection,
-    vtab::arrow::WritableVector,
-    Connection,
 };
+
+use self::function::{ScalarFunction, ScalarFunctionSet};
+
 mod function;
 
 /// The duckdb Arrow scalar function interface
@@ -24,18 +48,36 @@ pub use arrow::{ArrowFunctionSignature, ArrowScalarParams, VArrowScalar};
 /// Duckdb scalar function trait
 pub trait VScalar: Sized {
     /// State set at registration time. Persists for the lifetime of the catalog entry.
-    /// Shared across worker threads and invocations — must not be modified during execution.
+    /// Shared across worker threads and invocations; any interior mutation must be synchronized.
     /// Must be `'static` as it is stored in DuckDB and may outlive the current stack frame.
     type State: Sized + Send + Sync + 'static;
-    /// The actual function
+    /// The actual function.
     ///
-    /// # Safety
+    /// DuckDB guarantees that `input` and `output` stay live for the duration
+    /// of this call. Implementations must populate `output` for rows
+    /// `0..input.len()` and must not read or write beyond that range.
     ///
-    /// This function is unsafe because it:
+    /// This mirrors [`VTab::func`](crate::vtab::VTab::func): the method itself
+    /// is safe, but `input` and `output` are accessed through the vector
+    /// wrappers in [`crate::core`], several of whose accessors are `unsafe`.
     ///
-    /// - Dereferences multiple raw pointers (`func`).
+    /// # Working with vectors
     ///
-    unsafe fn invoke(
+    /// When reaching for those `unsafe` accessors, implementations must uphold
+    /// their contracts:
+    ///
+    /// - only read and write within the rows and column types DuckDB provided
+    ///   for this invocation;
+    /// - not retain `input`, `output`, or any vector/slice derived from them
+    ///   past return;
+    /// - not hold two writable wrappers over the same column at the same
+    ///   time. The column accessors (`flat_vector`, `list_vector`, ...) take
+    ///   `&self`, so safe code can obtain two wrappers over one column and
+    ///   call `as_mut_slice` on each, yielding overlapping `&mut [T]` —
+    ///   undefined behavior.
+    ///
+    /// See the callback containment contract in [`crate::vscalar`].
+    fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
@@ -126,12 +168,13 @@ impl From<duckdb_function_info> for ScalarFunctionInfo {
 
 impl ScalarFunctionInfo {
     pub unsafe fn get_extra_info<T>(&self) -> &T {
-        &*(duckdb_scalar_function_get_extra_info(self.0).cast())
+        unsafe { &*(duckdb_scalar_function_get_extra_info(self.0).cast()) }
     }
+}
 
-    pub unsafe fn set_error(&self, error: &str) {
-        let c_str = CString::new(error).unwrap();
-        duckdb_scalar_function_set_error(self.0, c_str.as_ptr());
+impl CallbackErrorSink for ScalarFunctionInfo {
+    fn set_c_error(&self, error: &CStr) {
+        unsafe { duckdb_scalar_function_set_error(self.0, error.as_ptr()) };
     }
 }
 
@@ -140,11 +183,10 @@ where
     T: VScalar,
 {
     let info = ScalarFunctionInfo::from(info);
-    let mut input = DataChunkHandle::new_unowned(input);
-    let result = T::invoke(info.get_extra_info(), &mut input, &mut output);
-    if let Err(e) = result {
-        info.set_error(&e.to_string());
-    }
+    contain_callback(&info, || unsafe {
+        let mut input = DataChunkHandle::new_unowned(input);
+        T::invoke(info.get_extra_info(), &mut input, &mut output)
+    });
 }
 
 impl Connection {
@@ -199,299 +241,4 @@ impl InnerConnection {
 }
 
 #[cfg(test)]
-mod test {
-    use std::error::Error;
-
-    use arrow::array::Array;
-    use libduckdb_sys::duckdb_string_t;
-
-    use crate::{
-        core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-        types::DuckString,
-        vtab::arrow::WritableVector,
-        Connection,
-    };
-
-    use super::{ScalarFunctionSignature, VScalar};
-
-    struct ErrorScalar {}
-
-    impl VScalar for ErrorScalar {
-        type State = ();
-
-        unsafe fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            _: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut msg = input.flat_vector(0).as_slice_with_len::<duckdb_string_t>(input.len())[0];
-            let string = DuckString::new(&mut msg).as_str();
-            Err(format!("Error: {string}").into())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Varchar.into()],
-                LogicalTypeId::Varchar.into(),
-            )]
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct TestState {
-        multiplier: usize,
-        prefix: String,
-    }
-
-    impl Default for TestState {
-        fn default() -> Self {
-            Self {
-                multiplier: 3,
-                prefix: "default".to_string(),
-            }
-        }
-    }
-
-    struct EchoScalar {}
-
-    impl VScalar for EchoScalar {
-        type State = TestState;
-
-        unsafe fn invoke(
-            state: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let values = input.flat_vector(0);
-            let values = values.as_slice_with_len::<duckdb_string_t>(input.len());
-            let strings = values
-                .iter()
-                .map(|ptr| DuckString::new(&mut { *ptr }).as_str().to_string())
-                .take(input.len());
-            let output = output.flat_vector();
-
-            for s in strings {
-                let res = format!("{}: {}", state.prefix, s.repeat(state.multiplier));
-                output.insert(0, res.as_str());
-            }
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Varchar.into()],
-                LogicalTypeId::Varchar.into(),
-            )]
-        }
-    }
-
-    struct Repeat {}
-
-    impl VScalar for Repeat {
-        type State = ();
-
-        unsafe fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let output = output.flat_vector();
-            let counts = input.flat_vector(1);
-            let values = input.flat_vector(0);
-            let values = values.as_slice_with_len::<duckdb_string_t>(input.len());
-            let strings = values
-                .iter()
-                .map(|ptr| DuckString::new(&mut { *ptr }).as_str().to_string());
-            let counts = counts.as_slice_with_len::<i32>(input.len());
-            for (count, value) in counts.iter().zip(strings).take(input.len()) {
-                output.insert(0, value.repeat((*count) as usize).as_str());
-            }
-
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![
-                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
-                    LogicalTypeHandle::from(LogicalTypeId::Integer),
-                ],
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            )]
-        }
-    }
-
-    #[test]
-    fn test_scalar() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-
-        // Test with default state
-        {
-            conn.register_scalar_function::<EchoScalar>("echo")?;
-
-            let mut stmt = conn.prepare("select echo('x')")?;
-            let mut rows = stmt.query([])?;
-
-            while let Some(row) = rows.next()? {
-                let res: String = row.get(0)?;
-                assert_eq!(res, "default: xxx");
-            }
-        }
-
-        // Test with custom state
-        {
-            conn.register_scalar_function_with_state::<EchoScalar>(
-                "echo2",
-                &TestState {
-                    multiplier: 5,
-                    prefix: "custom".to_string(),
-                },
-            )?;
-
-            let mut stmt = conn.prepare("select echo2('y')")?;
-            let mut rows = stmt.query([])?;
-
-            while let Some(row) = rows.next()? {
-                let res: String = row.get(0)?;
-                assert_eq!(res, "custom: yyyyy");
-            }
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_scalar_error() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-        conn.register_scalar_function::<ErrorScalar>("error_udf")?;
-
-        let mut stmt = conn.prepare("select error_udf('blurg') as hello")?;
-        if let Err(err) = stmt.query([]) {
-            assert!(err.to_string().contains("Error: blurg"));
-        } else {
-            panic!("Expected an error");
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_repeat_scalar() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-        conn.register_scalar_function::<Repeat>("nobie_repeat")?;
-
-        let batches = conn
-            .prepare("select nobie_repeat('Ho ho ho 🎅🎄', 3) as message from range(5)")?
-            .query_arrow([])?
-            .collect::<Vec<_>>();
-
-        for batch in batches.iter() {
-            let array = batch.column(0);
-            let array = array.as_any().downcast_ref::<::arrow::array::StringArray>().unwrap();
-            for i in 0..array.len() {
-                assert_eq!(array.value(i), "Ho ho ho 🎅🎄Ho ho ho 🎅🎄Ho ho ho 🎅🎄");
-            }
-        }
-
-        Ok(())
-    }
-
-    // Counters for testing volatile functions
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    static NON_VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct CounterScalar {}
-
-    impl VScalar for CounterScalar {
-        type State = ();
-
-        unsafe fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let len = input.len();
-            let mut output_vec = output.flat_vector();
-            let data = output_vec.as_mut_slice::<i64>();
-
-            for item in data.iter_mut().take(len) {
-                *item = NON_VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
-            }
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![],
-                LogicalTypeHandle::from(LogicalTypeId::Bigint),
-            )]
-        }
-    }
-
-    struct VolatileCounterScalar {}
-
-    impl VScalar for VolatileCounterScalar {
-        type State = ();
-
-        unsafe fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let len = input.len();
-            let mut output_vec = output.flat_vector();
-            let data = output_vec.as_mut_slice::<i64>();
-
-            for item in data.iter_mut().take(len) {
-                *item = VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
-            }
-            Ok(())
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![ScalarFunctionSignature::exact(
-                vec![],
-                LogicalTypeHandle::from(LogicalTypeId::Bigint),
-            )]
-        }
-
-        fn volatile() -> bool {
-            true
-        }
-    }
-
-    #[test]
-    fn test_volatile_scalar() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-
-        VOLATILE_COUNTER.store(0, Ordering::SeqCst);
-        conn.register_scalar_function::<VolatileCounterScalar>("volatile_counter")?;
-
-        let values: Vec<i64> = conn
-            .prepare("SELECT volatile_counter() FROM generate_series(1, 5)")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-
-        assert_eq!(values, [0, 1, 2, 3, 4]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_non_volatile_scalar() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-
-        NON_VOLATILE_COUNTER.store(0, Ordering::SeqCst);
-        conn.register_scalar_function::<CounterScalar>("non_volatile_counter")?;
-
-        // Constant folding should make every row identical
-        let distinct_count: i64 = conn
-            .prepare("SELECT COUNT(DISTINCT non_volatile_counter()) FROM generate_series(1, 5)")?
-            .query_row([], |row| row.get(0))?;
-
-        assert_eq!(distinct_count, 1);
-
-        Ok(())
-    }
-}
+mod tests;

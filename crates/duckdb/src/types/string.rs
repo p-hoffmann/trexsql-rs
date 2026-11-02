@@ -1,4 +1,4 @@
-use libduckdb_sys::{duckdb_string_t, duckdb_string_t_data, duckdb_string_t_length};
+use libduckdb_sys::v1::{duckdb_string_t, duckdb_string_t_data, duckdb_string_t_length};
 
 /// Wrapper for underlying duck string type with a lifetime bound to a &mut duckdb_string_t
 pub struct DuckString<'a> {
@@ -7,7 +7,6 @@ pub struct DuckString<'a> {
 
 impl<'a> DuckString<'a> {
     /// Creates a DuckString from the underlying duck string type
-    #[allow(dead_code)]
     pub fn new(ptr: &'a mut duckdb_string_t) -> Self {
         DuckString { ptr }
     }

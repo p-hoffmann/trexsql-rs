@@ -1,6 +1,6 @@
 //! Prepared statements cache for faster execution.
 
-use crate::{raw_statement::RawStatement, Connection, Result, Statement};
+use crate::{Connection, Result, Statement, raw_statement::RawStatement};
 use hashlink::LruCache;
 use std::{
     cell::RefCell,
@@ -91,7 +91,6 @@ impl<'conn> DerefMut for CachedStatement<'conn> {
 }
 
 impl Drop for CachedStatement<'_> {
-    #[allow(unused_must_use)]
     #[inline]
     fn drop(&mut self) {
         if let Some(stmt) = self.stmt.take() {
@@ -176,7 +175,8 @@ impl StatementCache {
 #[cfg(test)]
 mod test {
     use super::StatementCache;
-    use crate::{Connection, Result};
+    use crate::{Connection, Result, core::LogicalTypeId, types::Value};
+    use arrow::array::Int32Array;
     use fallible_iterator::FallibleIterator;
 
     impl StatementCache {
@@ -303,6 +303,212 @@ mod test {
                 stmt.query([])?.map(|r| <(i32, i32)>::try_from(r)).next()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ddl_with_trailing_geometry_uses_executed_metadata() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            r#"
+            CREATE TABLE foo (x INT);
+            INSERT INTO foo VALUES (1);
+        "#,
+        )?;
+
+        let sql = "SELECT * FROM foo";
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            assert_eq!(Ok(Some(1i32)), stmt.query([])?.map(|r| r.get(0)).next());
+        }
+
+        db.execute_batch(
+            r#"
+            ALTER TABLE foo ADD COLUMN geom GEOMETRY;
+            UPDATE foo SET geom = 'POINT EMPTY'::GEOMETRY;
+        "#,
+        )?;
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            let got = stmt.query([])?.map(|r| r.get_ref(1).map(|v| v.to_owned())).next()?;
+            let point_empty_wkb = vec![
+                0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF8, 0x7F, 0, 0, 0, 0, 0, 0, 0xF8, 0x7F,
+            ];
+            match got {
+                Some(Value::Geometry(wkb)) => assert_eq!(wkb, point_empty_wkb),
+                other => panic!("expected trailing geometry column, got {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ddl_with_trailing_ambiguous_decimal_uses_executed_metadata() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            r#"
+            CREATE TABLE foo (x INT);
+            INSERT INTO foo VALUES (1);
+        "#,
+        )?;
+
+        let sql = "SELECT * FROM foo";
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            assert_eq!(Ok(Some(1i32)), stmt.query([])?.map(|r| r.get(0)).next());
+        }
+
+        db.execute_batch(
+            r#"
+            ALTER TABLE foo ADD COLUMN y UHUGEINT;
+            UPDATE foo SET y = 340282366920938463463374607431768211455::UHUGEINT;
+        "#,
+        )?;
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            assert_eq!(
+                Ok(Some((Value::Int(1), Value::UHugeInt(u128::MAX)))),
+                stmt.query([])?
+                    .map(|r| Ok((r.get_ref(0)?.to_owned(), r.get_ref(1)?.to_owned())))
+                    .next()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ddl_with_same_index_ambiguous_logical_type_uses_executed_metadata() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            r#"
+            CREATE TABLE foo (x HUGEINT);
+            INSERT INTO foo VALUES (0);
+        "#,
+        )?;
+
+        let sql = "SELECT * FROM foo";
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            assert_eq!(
+                Ok(Some(Value::HugeInt(0))),
+                stmt.query([])?.map(|r| r.get_ref(0).map(|v| v.to_owned())).next()
+            );
+        }
+
+        db.execute_batch(
+            r#"
+            DROP TABLE foo;
+            CREATE TABLE foo (x UHUGEINT);
+            INSERT INTO foo VALUES (340282366920938463463374607431768211455::UHUGEINT);
+        "#,
+        )?;
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            assert_eq!(
+                Ok(Some(Value::UHugeInt(u128::MAX))),
+                stmt.query([])?.map(|r| r.get_ref(0).map(|v| v.to_owned())).next()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ddl_with_same_index_ambiguous_logical_type_updates_column_logical_type() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            r#"
+            CREATE TABLE foo (x HUGEINT);
+            INSERT INTO foo VALUES (0);
+        "#,
+        )?;
+
+        let sql = "SELECT * FROM foo";
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            let value = {
+                let mut rows = stmt.query([])?;
+                rows.next()?.unwrap().get_ref(0)?.to_owned()
+            };
+            assert_eq!(Value::HugeInt(0), value);
+            assert_eq!(LogicalTypeId::Hugeint, stmt.column_logical_type(0).id());
+        }
+
+        db.execute_batch(
+            r#"
+            DROP TABLE foo;
+            CREATE TABLE foo (x UHUGEINT);
+            INSERT INTO foo VALUES (340282366920938463463374607431768211455::UHUGEINT);
+        "#,
+        )?;
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            let value = {
+                let mut rows = stmt.query([])?;
+                rows.next()?.unwrap().get_ref(0)?.to_owned()
+            };
+            assert_eq!(Value::UHugeInt(u128::MAX), value);
+            assert_eq!(LogicalTypeId::UHugeint, stmt.column_logical_type(0).id());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ddl_with_stale_variant_uses_executed_streaming_metadata() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x VARIANT);")?;
+
+        let sql = "SELECT * FROM foo";
+
+        {
+            let stmt = db.prepare_cached(sql)?;
+            assert_eq!(LogicalTypeId::Variant, stmt.column_logical_type(0).id());
+        }
+
+        db.execute_batch(
+            r#"
+            DROP TABLE foo;
+            CREATE TABLE foo (x INTEGER);
+            INSERT INTO foo VALUES (42);
+        "#,
+        )?;
+
+        {
+            let mut stmt = db.prepare_cached(sql)?;
+            let batches = stmt.stream_arrow([])?.collect::<Result<Vec<_>>>()?;
+            assert_eq!(1, batches.len());
+
+            let values = batches[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(42, values.value(0));
+            assert_eq!(LogicalTypeId::Integer, stmt.column_logical_type(0).id());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_prepare_cached_multichunk_reexecution_resets_result_chunks() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let sql = "SELECT i FROM range(3000) AS t(i) ORDER BY i";
+
+        for _ in 0..2 {
+            let mut stmt = db.prepare_cached(sql)?;
+            let values = stmt
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>>>()?;
+
+            assert_eq!(values.len(), 3000);
+            assert_eq!(values[0], 0);
+            assert_eq!(values[2048], 2048);
+            assert_eq!(values[2999], 2999);
+        }
+
         Ok(())
     }
 

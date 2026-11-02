@@ -6,8 +6,8 @@ use arrow::{
 };
 
 use crate::{
+    arrow_interop::{WritableVector, data_chunk_to_arrow, to_duckdb_logical_type, write_arrow_array_to_vector},
     core::DataChunkHandle,
-    vtab::arrow::{data_chunk_to_arrow, to_duckdb_logical_type, write_arrow_array_to_vector, WritableVector},
 };
 
 use super::{ScalarFunctionSignature, ScalarParams, VScalar};
@@ -107,7 +107,7 @@ where
 {
     type State = T::State;
 
-    unsafe fn invoke(
+    fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,
         out: &mut dyn WritableVector,
@@ -133,11 +133,14 @@ mod test {
     use std::{error::Error, sync::Arc};
 
     use arrow::{
-        array::{Array, RecordBatch, StringArray},
-        datatypes::DataType,
+        array::{Array, AsArray, Int32Array, Int64Array, ListArray, RecordBatch, StringArray},
+        datatypes::{
+            ArrowPrimitiveType, DataType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+            TimestampNanosecondType, TimestampSecondType,
+        },
     };
 
-    use crate::{vscalar::arrow::ArrowFunctionSignature, Connection};
+    use crate::{Connection, vscalar::arrow::ArrowFunctionSignature};
 
     use super::VArrowScalar;
 
@@ -285,7 +288,7 @@ mod test {
             let array = batch.column(0);
             let array = array.as_any().downcast_ref::<::arrow::array::StringArray>().unwrap();
             for i in 0..array.len() {
-                assert_eq!(array.value(i), format!("Hello foo"));
+                assert_eq!(array.value(i), "Hello foo");
             }
         }
 
@@ -396,6 +399,154 @@ mod test {
 
         assert_eq!(string_values.value(0), "hello");
         assert_eq!(string_values.value(1), "world");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_arrow_scalar_reads_filtered_list_vectors() -> Result<(), Box<dyn Error>> {
+        struct ListFirstValueFunction;
+
+        impl VArrowScalar for ListFirstValueFunction {
+            type State = ();
+
+            fn invoke(_: &Self::State, input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn std::error::Error>> {
+                let lists = input.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+                let first_values = lists
+                    .iter()
+                    .map(|value| value.map(|value| value.as_any().downcast_ref::<Int32Array>().unwrap().value(0)))
+                    .collect::<Int32Array>();
+                Ok(Arc::new(first_values))
+            }
+
+            fn signatures() -> Vec<ArrowFunctionSignature> {
+                vec![ArrowFunctionSignature::exact(
+                    vec![DataType::List(Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Int32,
+                        true,
+                    )))],
+                    DataType::Int32,
+                )]
+            }
+        }
+
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<ListFirstValueFunction>("arrow_list_first_value")?;
+        conn.execute_batch(
+            "create table list_input as \
+             select i::integer as id, \
+                    case when i % 7 = 0 then null \
+                         else [i::integer, (i + 1)::integer] end as values \
+             from range(5000) t(i)",
+        )?;
+
+        let first_values = conn
+            .prepare(
+                "select arrow_list_first_value(values) \
+                 from list_input where id % 97 = 0 order by id",
+            )?
+            .query_map([], |row| row.get::<_, Option<i32>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let expected = (0..5000)
+            .step_by(97)
+            .map(|id| if id % 7 == 0 { None } else { Some(id) })
+            .collect::<Vec<_>>();
+        assert_eq!(first_values, expected);
+        Ok(())
+    }
+
+    fn timestamp_value<T>(input: &RecordBatch, column: usize, expected_type: &DataType) -> Result<i64, Box<dyn Error>>
+    where
+        T: ArrowPrimitiveType<Native = i64>,
+    {
+        let array = input.column(column);
+        if array.data_type() != expected_type {
+            return Err(format!(
+                "expected timestamp column {column} to have type {expected_type}, got {}",
+                array.data_type()
+            )
+            .into());
+        }
+
+        array
+            .as_primitive_opt::<T>()
+            .map(|timestamps| timestamps.value(0))
+            .ok_or_else(|| format!("timestamp column {column} has an unexpected Arrow array implementation").into())
+    }
+
+    #[test]
+    fn test_arrow_scalar_reads_timestamp_carriers() -> Result<(), Box<dyn Error>> {
+        struct TimestampCarrierProbe;
+
+        impl VArrowScalar for TimestampCarrierProbe {
+            type State = ();
+
+            fn invoke(_: &Self::State, input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn std::error::Error>> {
+                let timestamp_tz = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+                let actual = [
+                    timestamp_value::<TimestampSecondType>(&input, 0, &DataType::Timestamp(TimeUnit::Second, None))?,
+                    timestamp_value::<TimestampMillisecondType>(
+                        &input,
+                        1,
+                        &DataType::Timestamp(TimeUnit::Millisecond, None),
+                    )?,
+                    timestamp_value::<TimestampMicrosecondType>(
+                        &input,
+                        2,
+                        &DataType::Timestamp(TimeUnit::Microsecond, None),
+                    )?,
+                    timestamp_value::<TimestampNanosecondType>(
+                        &input,
+                        3,
+                        &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    )?,
+                    timestamp_value::<TimestampMicrosecondType>(&input, 4, &timestamp_tz)?,
+                ];
+                let expected = [
+                    1_704_067_200,
+                    1_704_067_200_123,
+                    1_704_067_200_123_456,
+                    1_704_067_200_000_000_123,
+                    1_704_067_200_123_456,
+                ];
+                if actual != expected {
+                    return Err(format!("expected timestamp carriers {expected:?}, got {actual:?}").into());
+                }
+
+                Ok(Arc::new(Int64Array::from_iter_values([actual[3]])))
+            }
+
+            fn signatures() -> Vec<ArrowFunctionSignature> {
+                vec![ArrowFunctionSignature::exact(
+                    vec![
+                        DataType::Timestamp(TimeUnit::Second, None),
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    ],
+                    DataType::Int64,
+                )]
+            }
+        }
+
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<TimestampCarrierProbe>("arrow_timestamp_carriers_raw")?;
+
+        // 2024-01-01T00:00:00Z in each carrier's resolution.
+        let value = conn.query_row(
+            "select arrow_timestamp_carriers_raw(\
+             TIMESTAMP_S '2024-01-01 00:00:00', \
+             TIMESTAMP_MS '2024-01-01 00:00:00.123', \
+             TIMESTAMP '2024-01-01 00:00:00.123456', \
+             TIMESTAMP_NS '2024-01-01 00:00:00.000000123', \
+             TIMESTAMPTZ '2024-01-01 00:00:00.123456+00')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(value, 1_704_067_200_000_000_123);
 
         Ok(())
     }

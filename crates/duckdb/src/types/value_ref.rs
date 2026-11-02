@@ -1,15 +1,13 @@
 use super::{Type, Value};
-use crate::types::{FromSqlError, FromSqlResult, OrderedMap};
+use crate::types::{Decimal, FromSqlError, FromSqlResult, OrderedMap};
 
-use crate::Row;
-use rust_decimal::prelude::*;
-
+use crate::{Error, Result, Row};
 use arrow::{
     array::{
         Array, ArrayRef, DictionaryArray, FixedSizeListArray, LargeListArray, ListArray, MapArray, StringArray,
         StructArray, UnionArray,
     },
-    datatypes::{UInt16Type, UInt32Type, UInt8Type},
+    datatypes::{UInt8Type, UInt16Type, UInt32Type},
 };
 
 /// An absolute length of time in seconds, milliseconds, microseconds or nanoseconds.
@@ -39,10 +37,15 @@ impl TimeUnit {
 }
 
 /// A non-owning [static type value](https://duckdb.org/docs/sql/data_types/overview). Typically the
-/// memory backing this value is owned by SQLite.
+/// memory backing this value is owned by DuckDB.
+///
+/// Container variants decode child values without DuckDB child logical type
+/// metadata. See the [`crate::types`] compatibility notes for `UHUGEINT`
+/// behavior inside containers.
 ///
 /// See [`Value`](Value) for an owning dynamic type value.
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ValueRef<'a> {
     /// The value is a `NULL` value.
     Null,
@@ -58,6 +61,13 @@ pub enum ValueRef<'a> {
     BigInt(i64),
     /// The value is a signed huge integer.
     HugeInt(i128),
+    /// The value is an unsigned huge integer.
+    ///
+    /// Top-level `UHUGEINT` result values decode to this variant because row
+    /// decoding uses DuckDB logical type metadata. Borrowed container values do
+    /// not carry that metadata and cannot recover nested `UHUGEINT` values
+    /// above `i128::MAX`.
+    UHugeInt(u128),
     /// The value is a unsigned tiny integer.
     UTinyInt(u8),
     /// The value is a unsigned small integer.
@@ -70,7 +80,10 @@ pub enum ValueRef<'a> {
     Float(f32),
     /// The value is a f64.
     Double(f64),
-    /// The value is a decimal
+    /// The value is a DuckDB decimal.
+    ///
+    /// [`Decimal`] stores DuckDB's decimal width, scale, and scaled integer
+    /// payload.
     Decimal(Decimal),
     /// The value is a timestamp.
     Timestamp(TimeUnit, i64),
@@ -78,6 +91,12 @@ pub enum ValueRef<'a> {
     Text(&'a [u8]),
     /// The value is a blob of data
     Blob(&'a [u8]),
+    /// The value is a top-level `GEOMETRY`, represented as WKB bytes.
+    ///
+    /// Nested `GEOMETRY` values currently materialize through their Arrow
+    /// binary carrier as `Blob` values. See [`Value::Geometry`] for binding
+    /// and appender guidance.
+    Geometry(&'a [u8]),
     /// The value is a date32
     Date32(i32),
     /// The value is a time64
@@ -91,17 +110,17 @@ pub enum ValueRef<'a> {
         /// nanos
         nanos: i64,
     },
-    /// The value is a list
+    /// The value is a list.
     List(ListType<'a>, usize),
     /// The value is an enum
     Enum(EnumType<'a>, usize),
-    /// The value is a struct
+    /// The value is a struct.
     Struct(&'a StructArray, usize),
-    /// The value is an array
+    /// The value is an array.
     Array(&'a FixedSizeListArray, usize),
-    /// The value is a map
+    /// The value is a map.
     Map(&'a MapArray, usize),
-    /// The value is a union
+    /// The value is a union.
     Union(&'a ArrayRef, usize),
 }
 
@@ -137,6 +156,7 @@ impl ValueRef<'_> {
             ValueRef::Int(_) => Type::Int,
             ValueRef::BigInt(_) => Type::BigInt,
             ValueRef::HugeInt(_) => Type::HugeInt,
+            ValueRef::UHugeInt(_) => Type::UHugeInt,
             ValueRef::UTinyInt(_) => Type::UTinyInt,
             ValueRef::USmallInt(_) => Type::USmallInt,
             ValueRef::UInt(_) => Type::UInt,
@@ -147,6 +167,7 @@ impl ValueRef<'_> {
             ValueRef::Timestamp(..) => Type::Timestamp,
             ValueRef::Text(_) => Type::Text,
             ValueRef::Blob(_) => Type::Blob,
+            ValueRef::Geometry(_) => Type::Geometry,
             ValueRef::Date32(_) => Type::Date32,
             ValueRef::Time64(..) => Type::Time64,
             ValueRef::Interval { .. } => Type::Interval,
@@ -169,23 +190,50 @@ impl ValueRef<'_> {
 }
 
 impl<'a> ValueRef<'a> {
-    /// If `self` is case `Text`, returns the string value. Otherwise, returns
-    /// [`Err(Error::InvalidColumnType)`](crate::Error::InvalidColumnType).
+    /// If `self` is `Text` or `Enum`, returns the string value. Otherwise,
+    /// returns `Err(FromSqlError::InvalidType)`.
     #[inline]
     pub fn as_str(&self) -> FromSqlResult<&'a str> {
         match *self {
             ValueRef::Text(t) => std::str::from_utf8(t).map_err(|e| FromSqlError::Other(Box::new(e))),
+            ValueRef::Enum(ref enum_type, idx) => {
+                let (values, key) = match enum_type {
+                    EnumType::UInt8(arr) => (arr.values(), arr.key(idx)),
+                    EnumType::UInt16(arr) => (arr.values(), arr.key(idx)),
+                    EnumType::UInt32(arr) => (arr.values(), arr.key(idx)),
+                };
+                let dict_key = key.ok_or(FromSqlError::InvalidType)?;
+                let string_array = values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| FromSqlError::Other("enum dictionary values are not strings".into()))?;
+                if dict_key >= string_array.len() {
+                    return Err(FromSqlError::Other(
+                        format!("enum key {} out of bounds (len {})", dict_key, string_array.len()).into(),
+                    ));
+                }
+                Ok(string_array.value(dict_key))
+            }
             _ => Err(FromSqlError::InvalidType),
         }
     }
 
-    /// If `self` is case `Blob`, returns the byte slice. Otherwise, returns
-    /// [`Err(Error::InvalidColumnType)`](crate::Error::InvalidColumnType).
+    /// If `self` is `Blob`, `Text`, or `Geometry`, returns the byte slice.
+    /// Otherwise, returns `Err(FromSqlError::InvalidType)`.
     #[inline]
     pub fn as_blob(&self) -> FromSqlResult<&'a [u8]> {
         match *self {
-            ValueRef::Blob(b) => Ok(b),
-            ValueRef::Text(t) => Ok(t),
+            ValueRef::Blob(b) | ValueRef::Text(b) | ValueRef::Geometry(b) => Ok(b),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+
+    /// If `self` is `Geometry`, returns the WKB byte slice. Otherwise, returns
+    /// `Err(FromSqlError::InvalidType)`.
+    #[inline]
+    pub fn as_geometry_wkb(&self) -> FromSqlResult<&'a [u8]> {
+        match *self {
+            ValueRef::Geometry(wkb) => Ok(wkb),
             _ => Err(FromSqlError::InvalidType),
         }
     }
@@ -202,6 +250,7 @@ impl From<ValueRef<'_>> for Value {
             ValueRef::Int(i) => Self::Int(i),
             ValueRef::BigInt(i) => Self::BigInt(i),
             ValueRef::HugeInt(i) => Self::HugeInt(i),
+            ValueRef::UHugeInt(i) => Self::UHugeInt(i),
             ValueRef::UTinyInt(i) => Self::UTinyInt(i),
             ValueRef::USmallInt(i) => Self::USmallInt(i),
             ValueRef::UInt(i) => Self::UInt(i),
@@ -215,29 +264,11 @@ impl From<ValueRef<'_>> for Value {
                 Self::Text(s.to_string())
             }
             ValueRef::Blob(b) => Self::Blob(b.to_vec()),
+            ValueRef::Geometry(wkb) => Self::Geometry(wkb.to_vec()),
             ValueRef::Date32(d) => Self::Date32(d),
             ValueRef::Time64(t, d) => Self::Time64(t, d),
             ValueRef::Interval { months, days, nanos } => Self::Interval { months, days, nanos },
-            ValueRef::List(items, idx) => match items {
-                ListType::Regular(items) => {
-                    let offsets = items.offsets();
-                    from_list(
-                        offsets[idx].try_into().unwrap(),
-                        offsets[idx + 1].try_into().unwrap(),
-                        idx,
-                        items.values(),
-                    )
-                }
-                ListType::Large(items) => {
-                    let offsets = items.offsets();
-                    from_list(
-                        offsets[idx].try_into().unwrap(),
-                        offsets[idx + 1].try_into().unwrap(),
-                        idx,
-                        items.values(),
-                    )
-                }
-            },
+            ValueRef::List(items, idx) => from_list_value(items, idx),
             ValueRef::Enum(items, idx) => {
                 let dict_values = match items {
                     EnumType::UInt8(res) => res.values(),
@@ -255,60 +286,88 @@ impl From<ValueRef<'_>> for Value {
                 .unwrap();
                 Self::Enum(dict_values.value(dict_key).to_string())
             }
-            ValueRef::Struct(items, idx) => {
-                let capacity = items.columns().len();
-                let mut value = Vec::with_capacity(capacity);
-                value.extend(
-                    items
-                        .columns()
-                        .iter()
-                        .zip(items.fields().iter().map(|f| f.name().to_owned()))
-                        .map(|(column, name)| -> (String, Self) {
-                            (name, Row::value_ref_internal(idx, 0, column).to_owned())
-                        }),
-                );
-                Self::Struct(OrderedMap::from(value))
-            }
-            ValueRef::Map(arr, idx) => {
-                let keys = arr.keys();
-                let values = arr.values();
-                let offsets = arr.offsets();
-                let range = offsets[idx]..offsets[idx + 1];
-                let capacity = range.len();
-                let mut map_vec = Vec::with_capacity(capacity);
-                map_vec.extend(range.map(|row| {
-                    let row = row.try_into().unwrap();
-                    let key = Row::value_ref_internal(row, idx, keys).to_owned();
-                    let value = Row::value_ref_internal(row, idx, values).to_owned();
-                    (key, value)
-                }));
-                Self::Map(OrderedMap::from(map_vec))
-            }
-            ValueRef::Array(items, idx) => {
-                let value_length = usize::try_from(items.value_length()).unwrap();
-                let range = (idx * value_length)..((idx + 1) * value_length);
-                let capacity = value_length;
-                let mut array_vec = Vec::with_capacity(capacity);
-                array_vec.extend(range.map(|row| Row::value_ref_internal(row, idx, items.values()).to_owned()));
-                Self::Array(array_vec)
-            }
-            ValueRef::Union(column, idx) => {
-                let column = column.as_any().downcast_ref::<UnionArray>().unwrap();
-                let type_id = column.type_id(idx);
-                let value_offset = column.value_offset(idx);
-
-                let tag = Row::value_ref_internal(idx, value_offset, column.child(type_id));
-                Self::Union(Box::new(tag.to_owned()))
-            }
+            ValueRef::Struct(items, idx) => from_struct(items, idx),
+            ValueRef::Map(arr, idx) => from_map(arr, idx),
+            ValueRef::Array(items, idx) => from_array(items, idx),
+            ValueRef::Union(column, idx) => from_union(column, idx),
         }
     }
 }
 
-fn from_list(start: usize, end: usize, idx: usize, values: &ArrayRef) -> Value {
+fn from_list_value(items: ListType<'_>, idx: usize) -> Value {
+    match items {
+        ListType::Regular(items) => {
+            let offsets = items.offsets();
+            from_list(
+                offsets[idx].try_into().unwrap(),
+                offsets[idx + 1].try_into().unwrap(),
+                items.values(),
+            )
+        }
+        ListType::Large(items) => {
+            let offsets = items.offsets();
+            from_list(
+                offsets[idx].try_into().unwrap(),
+                offsets[idx + 1].try_into().unwrap(),
+                items.values(),
+            )
+        }
+    }
+}
+
+fn from_list(start: usize, end: usize, values: &ArrayRef) -> Value {
     let capacity = end - start;
     let mut list_vec = Vec::with_capacity(capacity);
-    list_vec.extend((start..end).map(|row| Row::value_ref_internal(row, idx, values).to_owned()));
+    list_vec.extend((start..end).map(|row| Row::value_ref_internal(row, values).to_owned()));
     Value::List(list_vec)
+}
+
+fn from_struct(items: &StructArray, idx: usize) -> Value {
+    let capacity = items.columns().len();
+    let mut value = Vec::with_capacity(capacity);
+    value.extend(
+        items
+            .columns()
+            .iter()
+            .zip(items.fields().iter().map(|f| f.name().to_owned()))
+            .map(|(column, name)| -> (String, Value) { (name, Row::value_ref_internal(idx, column).to_owned()) }),
+    );
+    Value::Struct(OrderedMap::from(value))
+}
+
+fn from_map(arr: &MapArray, idx: usize) -> Value {
+    let keys = arr.keys();
+    let values = arr.values();
+    let offsets = arr.offsets();
+    let range = offsets[idx]..offsets[idx + 1];
+    let capacity = range.len();
+    let mut map_vec = Vec::with_capacity(capacity);
+    map_vec.extend(range.map(|row| {
+        let row = row.try_into().unwrap();
+        let key = Row::value_ref_internal(row, keys).to_owned();
+        let value = Row::value_ref_internal(row, values).to_owned();
+        (key, value)
+    }));
+    Value::Map(OrderedMap::from(map_vec))
+}
+
+fn from_array(items: &FixedSizeListArray, idx: usize) -> Value {
+    let value_length = usize::try_from(items.value_length()).unwrap();
+    let range = (idx * value_length)..((idx + 1) * value_length);
+    let mut array_vec = Vec::with_capacity(value_length);
+    array_vec.extend(range.map(|row| Row::value_ref_internal(row, items.values()).to_owned()));
+    Value::Array(array_vec)
+}
+
+fn from_union(column: &ArrayRef, idx: usize) -> Value {
+    let column = column.as_any().downcast_ref::<UnionArray>().unwrap();
+    let type_id = column.type_id(idx);
+    // Arrow's value offset is the row in the active child array. DuckDB
+    // currently emits sparse unions where this equals `idx`, but using the
+    // offset keeps the decoder correct for dense unions too.
+    let value_offset = column.value_offset(idx);
+    let tag = Row::value_ref_internal(value_offset, column.child(type_id));
+    Value::Union(Box::new(tag.to_owned()))
 }
 
 impl<'a> From<&'a str> for ValueRef<'a> {
@@ -325,7 +384,69 @@ impl<'a> From<&'a [u8]> for ValueRef<'a> {
     }
 }
 
+impl From<Decimal> for ValueRef<'_> {
+    #[inline]
+    fn from(decimal: Decimal) -> Self {
+        Self::Decimal(decimal)
+    }
+}
+
+pub(crate) fn value_ref_from_value<'a>(
+    value: &'a Value,
+    unsupported_message: impl FnOnce(&'static str) -> String,
+) -> Result<ValueRef<'a>> {
+    if let Some(variant) = unsupported_value_variant(value) {
+        return Err(Error::ToSqlConversionFailure(unsupported_message(variant).into()));
+    }
+
+    Ok(ValueRef::from(value))
+}
+
+pub(crate) fn binding_unsupported_value(value_type: impl std::fmt::Display) -> String {
+    format!("binding {value_type} parameters is not yet supported")
+}
+
+fn unsupported_value_variant(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Null
+        | Value::Boolean(_)
+        | Value::TinyInt(_)
+        | Value::SmallInt(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::HugeInt(_)
+        | Value::UHugeInt(_)
+        | Value::UTinyInt(_)
+        | Value::USmallInt(_)
+        | Value::UInt(_)
+        | Value::UBigInt(_)
+        | Value::Float(_)
+        | Value::Double(_)
+        | Value::Decimal(_)
+        | Value::Timestamp(_, _)
+        | Value::Text(_)
+        | Value::Blob(_)
+        | Value::Geometry(_)
+        | Value::Date32(_)
+        | Value::Time64(_, _)
+        | Value::Interval { .. } => None,
+        Value::List(_) => Some("List"),
+        Value::Array(_) => Some("Array"),
+        Value::Struct(_) => Some("Struct"),
+        Value::Map(_) => Some("Map"),
+        Value::Union(_) => Some("Union"),
+        Value::Enum(_) => Some("Enum"),
+    }
+}
+
 impl<'a> From<&'a Value> for ValueRef<'a> {
+    /// Converts non-container `Value` variants into a borrowed `ValueRef`.
+    ///
+    /// # Panics
+    ///
+    /// Panics for `Value::Enum`, `Value::List`, `Value::Struct`, `Value::Map`,
+    /// `Value::Array`, and `Value::Union`. Internal bind and append paths use
+    /// `value_ref_from_value` for fallible conversion.
     #[inline]
     fn from(value: &'a Value) -> Self {
         match *value {
@@ -336,6 +457,7 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
             Value::Int(i) => ValueRef::Int(i),
             Value::BigInt(i) => ValueRef::BigInt(i),
             Value::HugeInt(i) => ValueRef::HugeInt(i),
+            Value::UHugeInt(i) => ValueRef::UHugeInt(i),
             Value::UTinyInt(i) => ValueRef::UTinyInt(i),
             Value::USmallInt(i) => ValueRef::USmallInt(i),
             Value::UInt(i) => ValueRef::UInt(i),
@@ -346,12 +468,18 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
             Value::Timestamp(tu, t) => ValueRef::Timestamp(tu, t),
             Value::Text(ref s) => ValueRef::Text(s.as_bytes()),
             Value::Blob(ref b) => ValueRef::Blob(b),
+            Value::Geometry(ref wkb) => ValueRef::Geometry(wkb),
             Value::Date32(d) => ValueRef::Date32(d),
             Value::Time64(t, d) => ValueRef::Time64(t, d),
             Value::Interval { months, days, nanos } => ValueRef::Interval { months, days, nanos },
-            Value::Enum(..) => todo!(),
-            Value::List(..) | Value::Struct(..) | Value::Map(..) | Value::Array(..) | Value::Union(..) => {
-                unimplemented!()
+            Value::Enum(..)
+            | Value::List(..)
+            | Value::Struct(..)
+            | Value::Map(..)
+            | Value::Array(..)
+            | Value::Union(..) => {
+                let variant = unsupported_value_variant(value).expect("unsupported Value variant");
+                panic!("ValueRef::from(&Value::{variant}) is not supported; use value_ref_from_value")
             }
         }
     }
@@ -372,8 +500,42 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::types::Type;
+    use crate::types::{Type, Value, ValueRef};
     use crate::{Connection, Result};
+
+    #[test]
+    #[should_panic(expected = "ValueRef::from(&Value::List)")]
+    fn value_ref_from_list_value_panics() {
+        let value = Value::List(vec![Value::Int(1)]);
+        let _ = ValueRef::from(&value);
+    }
+
+    #[test]
+    fn test_geometry_ref_is_wkb_bytes() {
+        use crate::types::FromSql;
+
+        let wkb = &[1_u8, 1, 0, 0, 0];
+        let geometry = ValueRef::Geometry(wkb);
+
+        assert_eq!(geometry.data_type(), Type::Geometry);
+        assert_eq!(geometry.as_geometry_wkb().unwrap(), wkb);
+        assert_eq!(geometry.as_blob().unwrap(), wkb);
+        assert!(geometry.as_str().is_err());
+        assert!(ValueRef::Blob(wkb).as_geometry_wkb().is_err());
+        assert_eq!(ValueRef::Blob(wkb).as_blob().unwrap(), wkb);
+        assert_eq!(Vec::<u8>::column_result(geometry).unwrap(), wkb.to_vec());
+        assert_eq!(geometry.to_owned(), Value::Geometry(wkb.to_vec()));
+    }
+
+    #[test]
+    fn test_text_ref_is_convertible_to_bytes() {
+        use crate::types::FromSql;
+
+        let text = ValueRef::Text(b"goose");
+
+        assert_eq!(text.as_blob().unwrap(), b"goose");
+        assert_eq!(Vec::<u8>::column_result(text).unwrap(), b"goose".to_vec());
+    }
 
     #[test]
     fn test_list_types() -> Result<()> {

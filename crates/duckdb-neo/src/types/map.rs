@@ -1,0 +1,466 @@
+//! The `MAP` logical type.
+
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
+use super::{DuckDBType, FromValue, ToValue};
+use crate::{
+    Parameters, Result,
+    connection::FFILink,
+    data_chunk::VectorCollection,
+    error::Error,
+    ffi,
+    logical_type::{LogicalType, LogicalTypeID},
+    value::{Value, ValueInput},
+    vector::{Unknown, Vector, VectorElement, VectorWriter, WritableVectorElement},
+};
+
+/// Reads and writes `MAP` vectors with key type `K` and value type `V`.
+///
+/// Rows are written from a `HashMap`, in its iteration order. Like a `LIST`, the entries
+/// child is sized with [`Vector::set_child_size`] and each row takes the next entries; the
+/// [`List`](super::List) docs describe the initialization contract and trimming to
+/// [`Vector::child_offset`].
+#[derive(Debug)]
+pub struct Map<K, V>(PhantomData<(K, V)>);
+
+/// Key-value entries represented as a DuckDB `MAP`.
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct MapValue<K, V> {
+    /// Entries in insertion order.
+    pub entries: Vec<(K, V)>,
+}
+
+impl<K, V> From<Vec<(K, V)>> for MapValue<K, V> {
+    fn from(entries: Vec<(K, V)>) -> Self {
+        Self { entries }
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for MapValue<K, V> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl<K: DuckDBType, V: DuckDBType> DuckDBType for MapValue<K, V> {
+    fn logical_type<C: FFILink + ?Sized>(link: &C) -> Result<LogicalType> {
+        let key_type = Value::from_logical_type(link, &K::logical_type(link)?)?;
+        let value_type = Value::from_logical_type(link, &V::logical_type(link)?)?;
+        link.logical_type_create("MAP", Parameters::positional(&[&key_type, &value_type]))
+    }
+}
+
+impl<K: ToValue + DuckDBType, V: ToValue + DuckDBType> ToValue for MapValue<K, V> {
+    fn value<C: FFILink + ?Sized>(&self, link: &C) -> Result<Value> {
+        let mut keys = Vec::with_capacity(self.entries.len());
+        let mut values = Vec::with_capacity(self.entries.len());
+        for (key, value) in &self.entries {
+            keys.push(key.value(link)?);
+            values.push(value.value(link)?);
+        }
+
+        let key_type = K::logical_type(link)?;
+        let value_type = V::logical_type(link)?;
+        link.create_value(ValueInput::Map {
+            key_type: &key_type,
+            value_type: &value_type,
+            keys: &keys,
+            values: &values,
+        })
+    }
+}
+
+impl<K: FromValue, V: FromValue> FromValue for MapValue<K, Option<V>> {
+    fn _get_inner(value: &Value) -> Result<Self> {
+        let logical_type = value.logical_type()?;
+        if logical_type.id()? != LogicalTypeID::Map {
+            return Err(Error::invalid_input(format!(
+                "Expected MAP value, found {}",
+                logical_type.to_text()?
+            )));
+        }
+
+        let children = value.children()?;
+        if children.len() % 2 != 0 {
+            return Err(Error::invalid_input(format!(
+                "MAP exposed an odd number of children: {}",
+                children.len()
+            )));
+        }
+
+        let entries = children
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let key = K::from_value(&entry[0])?
+                    .ok_or_else(|| Error::invalid_input(format!("MAP entry {index} has a NULL key")))?;
+                Ok((key, V::from_value(&entry[1])?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { entries })
+    }
+}
+
+// SAFETY: a MAP is stored as a LIST of STRUCT(key, value), and `validate` checks both fields.
+unsafe impl<K: VectorElement, V: VectorElement> VectorElement for Map<K, V> {
+    const TYPE_ID: LogicalTypeID = LogicalTypeID::Map;
+
+    type Ref<'a>
+        = MapRow<'a, K, V>
+    where
+        K: 'a,
+        V: 'a;
+
+    type Internal<'a> = super::ListIndex;
+
+    fn validate(other: &LogicalType, children: Option<&VectorCollection>) -> Result<bool> {
+        if other.id()? != Self::TYPE_ID {
+            return Ok(false);
+        }
+
+        // MAP stores its entries as one STRUCT(key, value) child.
+        let fields = children
+            .filter(|children| children.col_count() == 1)
+            .map(|children| children.get_untyped_vector_at(0))
+            .transpose()?
+            .and_then(|entries| entries.children())
+            .filter(|fields| fields.col_count() == 2)
+            .ok_or_else(|| Error::invalid_input("Map vector must have one STRUCT(key, value) child"))?;
+
+        fields.get_untyped_vector_at(0)?.validate_as::<K>()?;
+        fields.get_untyped_vector_at(1)?.validate_as::<V>().map(|()| true)
+    }
+
+    unsafe fn get<'a, U: VectorElement>(
+        vector: &crate::vector::VectorReader<'a, U>,
+        physical: usize,
+        _logical: usize,
+    ) -> Self::Ref<'a>
+    where
+        Self: Sized + 'a,
+    {
+        let data_ptr = vector.as_ptr() as *const ffi::duckdb_v2_list_entry;
+        let list = unsafe { &*data_ptr.add(physical) };
+
+        // SAFETY: Map<K, V>::validate checked the entries and both fields.
+        let entries = unsafe { vector.child_reader::<crate::vector::Unknown>(0) };
+        let (keys, values) = unsafe { (entries.child_reader::<K>(0), entries.child_reader::<V>(1)) };
+        MapRow {
+            keys,
+            values,
+            offset: list.offset as usize,
+            length: list.length as usize,
+        }
+    }
+}
+
+impl<K: VectorElement, V: VectorElement> Vector<'_, Map<K, V>> {
+    /// Size the entries child to exactly `entries` and restart writes at its first entry.
+    ///
+    /// # Safety
+    /// Every entry below `entries` must be written before DuckDB reads this vector; see
+    /// [`List`](super::List) for sizing to an upper bound and trimming.
+    pub unsafe fn set_child_size(&mut self, entries: usize) -> Result<()> {
+        // SAFETY: the caller upholds the initialization contract.
+        unsafe { self.size_appended_child(entries) }
+    }
+
+    /// Return the first entry the next map write uses.
+    pub fn child_offset(&self) -> usize {
+        self.child_offset_cell().get()
+    }
+
+    /// Continue map writes at `offset`, e.g. with a new wrapper for a partially written vector.
+    ///
+    /// Moving backwards makes later writes replace entries of rows that were already written.
+    pub fn set_child_offset(&mut self, offset: usize) -> Result<()> {
+        self.move_appended_child_offset(offset)
+    }
+}
+
+impl<K: VectorElement, V: VectorElement> VectorWriter<'_, Map<K, V>> {
+    /// Return the first entry the next map write uses.
+    pub fn child_offset(&self) -> usize {
+        self.child_offset_cell().get()
+    }
+}
+
+// SAFETY: entries only cover keys and values written through the fields' own writers.
+unsafe impl<K: WritableVectorElement, V: WritableVectorElement> WritableVectorElement for Map<K, V> {
+    type Write<'a> = HashMap<K::Write<'a>, Option<V::Write<'a>>>;
+
+    #[inline]
+    unsafe fn write(vector: &mut VectorWriter<'_, Self>, index: usize, value: Option<Self::Write<'_>>) -> Result<()> {
+        let Some(value) = value else { return Ok(()) };
+        let len = value.len();
+        let offset = vector.child_offset_cell().get();
+        // SAFETY: Map<K, V>::validate checked the STRUCT(key, value) entries and both fields.
+        let entries = unsafe { vector.child_writer_unchecked::<Unknown>(0)? };
+        let size = entries.len();
+        let end = offset.checked_add(len).filter(|end| *end <= size).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "MAP row needs {len} entries, but only {} of {size} remain; size the child with set_child_size",
+                size - offset.min(size)
+            ))
+        })?;
+        for (entry, (key, value)) in (offset..end).zip(value) {
+            // SAFETY: the entry is in bounds, and the fields have one row per entry.
+            unsafe {
+                entries
+                    .child_writer_unchecked::<K>(0)?
+                    .set_unchecked(entry, Some(key))?;
+                entries.child_writer_unchecked::<V>(1)?.set_unchecked(entry, value)?;
+                entries.set_validity_unchecked(entry, true);
+            }
+        }
+        vector.child_offset_cell().set(end);
+        // SAFETY: the caller guarantees an in-bounds row, and the entry covers the entries just written.
+        unsafe {
+            vector.write_internal(
+                index,
+                Some(ffi::duckdb_v2_list_entry {
+                    offset: offset as u64,
+                    length: len as u64,
+                }),
+            )
+        }
+    }
+}
+
+/// A borrowed map row backed by matching ranges in key and value vectors.
+#[derive(Debug)]
+pub struct MapRow<'a, K: VectorElement, V: VectorElement> {
+    keys: crate::vector::VectorReader<'a, K>,
+    values: crate::vector::VectorReader<'a, V>,
+    pub(crate) offset: usize,
+    pub(crate) length: usize,
+}
+
+impl<'a, K: Debug + VectorElement, V: VectorElement + Debug> MapRow<'a, K, V>
+where
+    for<'b> K::Ref<'b>: PartialEq<&'b K> + Eq + std::hash::Hash,
+    for<'b> <V as VectorElement>::Ref<'b>: Debug,
+{
+    /// Convert the map row into a `HashMap`.
+    ///
+    /// # ! Experimental. Subject to change.
+    /// TODO: REVIEW
+    pub fn to_hash_map(&self) -> Result<HashMap<K::Ref<'a>, Option<V::Ref<'a>>>> {
+        let mut map = HashMap::new();
+        map.reserve(self.length);
+
+        for (key, value) in self.iter() {
+            if let Some(key) = key {
+                map.insert(key, value);
+            }
+        }
+
+        Ok(map)
+    }
+}
+
+impl<'a, K: VectorElement + 'a, V: VectorElement + 'a> MapRow<'a, K, V> {
+    /// Return the number of entries in the map.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Return whether the map has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Iterate over the map's `(key, value)` entries in storage order.
+    pub fn iter(&self) -> impl Iterator<Item = (Option<K::Ref<'a>>, Option<V::Ref<'a>>)> + use<'a, K, V> {
+        let (keys, values) = (self.keys.clone(), self.values.clone());
+        // SAFETY: The parent reader cached all descendant views before constructing this row.
+        (self.offset..self.offset + self.length)
+            .map(move |logical| unsafe { (keys.get_unchecked(logical), values.get_unchecked(logical)) })
+    }
+
+    /// Return the map's keys in storage order, aligned with [`Self::values`].
+    pub fn keys(&self) -> Vec<Option<K::Ref<'a>>> {
+        self.iter().map(|(key, _)| key).collect()
+    }
+
+    /// Return the map's values in storage order, aligned with [`Self::keys`].
+    pub fn values(&self) -> Vec<Option<V::Ref<'a>>> {
+        self.iter().map(|(_, value)| value).collect()
+    }
+}
+
+impl<'a, K: VectorElement, V: VectorElement> MapRow<'a, K, V>
+where
+    for<'b> K::Ref<'b>: PartialEq<&'b K>,
+{
+    /// Return the associated value; outer `None` means missing, inner `None` means NULL.
+    pub fn get(&self, key: &K) -> Option<Option<V::Ref<'a>>> {
+        // SAFETY: The parent reader cached all descendant views before constructing this row.
+        (self.offset..self.offset + self.length)
+            .find(|&logical| unsafe { self.keys.get_unchecked(logical) }.is_some_and(|value| value == key))
+            .map(|logical| unsafe { self.values.get_unchecked(logical) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        data_chunk::DataChunk,
+        environment::{Environment, StorageLocation},
+        types::List,
+    };
+
+    #[test]
+    fn map_value_conversions_preserve_order() {
+        let value = MapValue::from(vec![(2, "b"), (1, "a")]);
+        let collected = [(2, "b"), (1, "a")].into_iter().collect::<MapValue<_, _>>();
+        assert_eq!(value, collected);
+        assert_eq!(value.entries, [(2, "b"), (1, "a")]);
+        assert_eq!(MapValue::<i32, &str>::default(), MapValue::from(vec![]));
+    }
+
+    #[test]
+    fn map_write_null_value_empty_map_and_null_row() -> Result<()> {
+        let env = Environment::new()?;
+        let instance = env.open(StorageLocation::InMemory)?;
+        let conn = instance.connect()?;
+
+        let mut chunk = DataChunk::create(&conn, &[MapValue::<i32, i32>::logical_type(&conn)?], true)?;
+        {
+            let mut maps = chunk.get_vector_at_mut::<Map<i32, i32>>(0)?;
+            maps.set_size(3)?;
+            // SAFETY: row 0 writes both entries; the others write none.
+            unsafe { maps.set_child_size(2)? };
+            maps.writer()?.set(0, Some(HashMap::from([(1, None), (2, Some(20))])))?;
+            maps.writer()?.set(1, Some(HashMap::new()))?;
+            maps.writer()?.set(2, None)?;
+        }
+
+        let maps = chunk.get_vector_at::<Map<i32, i32>>(0)?;
+        let maps_reader = maps.reader()?;
+        let row = maps_reader.get(0)?.expect("row 0 is not NULL");
+        assert_eq!(row.get(&1), Some(None));
+        assert_eq!(row.get(&2), Some(Some(&20)));
+        assert_eq!(row.get(&3), None);
+        let mut values = row.values();
+        values.sort();
+        assert_eq!(values, [None, Some(&20)]);
+
+        assert!(maps_reader.get(1)?.expect("row 1 is not NULL").keys().is_empty());
+        assert!(maps_reader.get(2)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn map_row_len_is_empty_and_iter() -> Result<()> {
+        let env = Environment::new()?;
+        let instance = env.open(StorageLocation::InMemory)?;
+        let conn = instance.connect()?;
+
+        let mut chunk = DataChunk::create(&conn, &[MapValue::<i32, i32>::logical_type(&conn)?], true)?;
+        {
+            let mut maps = chunk.get_vector_at_mut::<Map<i32, i32>>(0)?;
+            maps.set_size(2)?;
+            // SAFETY: row 0 writes all three entries.
+            unsafe { maps.set_child_size(3)? };
+            maps.writer()?
+                .set(0, Some(HashMap::from([(1, None), (2, Some(20)), (3, Some(30))])))?;
+            maps.writer()?.set(1, Some(HashMap::new()))?;
+        }
+
+        let maps = chunk.get_vector_at::<Map<i32, i32>>(0)?;
+        let maps_reader = maps.reader()?;
+        let row = maps_reader.get(0)?.expect("row 0 is not NULL");
+        assert_eq!(row.len(), 3);
+        assert!(!row.is_empty());
+        let mut entries: Vec<_> = row.iter().collect();
+        assert_eq!(row.keys().into_iter().zip(row.values()).collect::<Vec<_>>(), entries);
+        entries.sort();
+        assert_eq!(
+            entries,
+            [(Some(&1), None), (Some(&2), Some(&20)), (Some(&3), Some(&30))]
+        );
+
+        let empty = maps_reader.get(1)?.expect("row 1 is not NULL");
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.iter().count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn map_row_with_list_keys() -> Result<()> {
+        let env = Environment::new()?;
+        let instance = env.open(StorageLocation::InMemory)?;
+        let conn = instance.connect()?;
+
+        let mut result = conn.query("SELECT MAP {[1, 2]: 10, [3]: NULL}", Parameters::None)?;
+        let chunk = result.next_chunk()?.expect("query returns one chunk");
+        let maps = chunk.get_vector_at::<Map<List<i32>, i32>>(0)?;
+        let row = maps.reader()?.get(0)?.expect("row 0 is not NULL");
+
+        let entries: Vec<_> = row
+            .iter()
+            .map(|(key, value)| (key.map(|key| key.iter().collect::<Vec<_>>()), value))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (Some(vec![Some(&1), Some(&2)]), Some(&10)),
+                (Some(vec![Some(&3)]), None)
+            ]
+        );
+
+        let keys: Vec<_> = row
+            .keys()
+            .into_iter()
+            .map(|key| key.unwrap().iter().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(keys, [vec![Some(&1), Some(&2)], vec![Some(&3)]]);
+        assert_eq!(row.values(), [Some(&10), None]);
+        Ok(())
+    }
+
+    #[test]
+    fn map_rows_take_entries_in_write_order() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[MapValue::<i32, String>::logical_type(&conn)?], true)?;
+        let mut maps = chunk.get_vector_at_mut::<Map<i32, String>>(0)?;
+        maps.set_size(2)?;
+        let error = maps.writer()?.set(0, Some(HashMap::from([(1, None)]))).unwrap_err();
+        assert!(error.message.contains("only 0 of 0 remain"), "{error}");
+        // SAFETY: the rows below write all three entries.
+        unsafe { maps.set_child_size(3)? };
+        {
+            let mut writer = maps.writer()?;
+            writer.set(1, Some(HashMap::from([(1, Some("one")), (2, None)])))?;
+            let error = writer
+                .set(0, Some(HashMap::from([(3, Some("three")), (4, None)])))
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("MAP row needs 2 entries, but only 1 of 3 remain"),
+                "{error}"
+            );
+            assert_eq!(writer.child_offset(), 2);
+            writer.set(0, Some(HashMap::from([(3, Some("three"))])))?;
+        }
+        let reader = maps.reader()?;
+        let row = reader.get(0)?.unwrap();
+        assert_eq!(row.offset, 2);
+        assert_eq!(row.get(&3), Some(Some("three")));
+        let row = reader.get(1)?.unwrap();
+        assert_eq!(row.offset, 0);
+        assert_eq!((row.get(&1), row.get(&2)), (Some(Some("one")), Some(None)));
+        Ok(())
+    }
+}

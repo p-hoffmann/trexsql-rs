@@ -1,7 +1,8 @@
 use std::{convert, sync::Arc};
 
 use super::{Error, Result, Statement};
-use crate::types::{self, EnumType, FromSql, FromSqlError, ListType, ValueRef};
+use crate::core::LogicalTypeId;
+use crate::types::{self, Decimal, EnumType, FromSql, FromSqlError, ListType, ValueRef};
 
 use arrow::{
     array::{
@@ -12,7 +13,6 @@ use arrow::{
 };
 use fallible_iterator::FallibleIterator;
 use fallible_streaming_iterator::FallibleStreamingIterator;
-use rust_decimal::prelude::*;
 
 /// An handle for the resulting rows of a query.
 #[must_use = "Rows is lazy and will do nothing unless consumed"]
@@ -20,14 +20,12 @@ pub struct Rows<'stmt> {
     pub(crate) stmt: Option<&'stmt Statement<'stmt>>,
     arr: Arc<Option<StructArray>>,
     row: Option<Row<'stmt>>,
-    current_row: usize,
     current_batch_row: usize,
 }
 
 impl<'stmt> Rows<'stmt> {
     #[inline]
     fn reset(&mut self) {
-        self.current_row = 0;
         self.current_batch_row = 0;
         self.arr = Arc::new(None);
     }
@@ -139,7 +137,6 @@ impl<'stmt> Rows<'stmt> {
             stmt: Some(stmt),
             arr: Arc::new(None),
             row: None,
-            current_row: 0,
             current_batch_row: 0,
         }
     }
@@ -251,28 +248,23 @@ impl<'stmt> FallibleStreamingIterator for Rows<'stmt> {
     fn advance(&mut self) -> Result<()> {
         match self.stmt {
             Some(stmt) => {
-                if self.current_row < stmt.row_count() {
-                    if self.current_batch_row >= self.batch_row_count() {
-                        self.arr = Arc::new(stmt.step());
-                        if self.arr.is_none() {
-                            self.row = None;
-                            return Ok(());
-                        }
-                        self.current_batch_row = 0;
+                while self.current_batch_row >= self.batch_row_count() {
+                    self.arr = Arc::new(stmt.step()?);
+                    if self.arr.is_none() {
+                        self.reset();
+                        self.row = None;
+                        return Ok(());
                     }
-                    self.row = Some(Row {
-                        stmt,
-                        arr: self.arr.clone(),
-                        current_row: self.current_batch_row,
-                    });
-                    self.current_row += 1;
-                    self.current_batch_row += 1;
-                    Ok(())
-                } else {
-                    self.reset();
-                    self.row = None;
-                    Ok(())
+                    self.current_batch_row = 0;
                 }
+
+                self.row = Some(Row {
+                    stmt,
+                    arr: self.arr.clone(),
+                    current_row: self.current_batch_row,
+                });
+                self.current_batch_row += 1;
+                Ok(())
             }
             None => {
                 self.row = None;
@@ -292,6 +284,12 @@ pub struct Row<'stmt> {
     pub(crate) stmt: &'stmt Statement<'stmt>,
     arr: Arc<Option<StructArray>>,
     current_row: usize,
+}
+
+fn decimal_value_ref(width: u8, scale: i8, value: i128) -> ValueRef<'static> {
+    let scale = Decimal::validate_signed_scale(width, scale)
+        .unwrap_or_else(|err| panic!("Invalid Arrow decimal metadata for width {width} scale {scale}: {err}"));
+    ValueRef::Decimal(Decimal::from_chunk(width, scale, value))
 }
 
 #[allow(clippy::needless_lifetimes)]
@@ -336,6 +334,7 @@ impl<'stmt> Row<'stmt> {
                 Error::InvalidColumnType(idx, self.stmt.column_name_unwrap(idx).into(), value.data_type())
             }
             FromSqlError::OutOfRange(i) => Error::IntegralValueOutOfRange(idx, i),
+            FromSqlError::OutOfRangeUnsigned(i) => Error::UnsignedIntegralValueOutOfRange(idx, i),
             FromSqlError::Other(err) => Error::FromSqlConversionFailure(idx, value.data_type(), err),
             #[cfg(feature = "uuid")]
             FromSqlError::InvalidUuidSize(_) => {
@@ -361,19 +360,46 @@ impl<'stmt> Row<'stmt> {
     /// name for this row.
     pub fn get_ref<I: RowIndex>(&self, idx: I) -> Result<ValueRef<'_>> {
         let idx = idx.idx(self.stmt)?;
-        // Narrowing from `ValueRef<'stmt>` (which `self.stmt.value_ref(idx)`
-        // returns) to `ValueRef<'a>` is needed because it's only valid until
-        // the next call to sqlite3_step.
+        // Narrowing from `ValueRef<'stmt>` (which `self.value_ref(row, idx)`
+        // returns) to `ValueRef<'a>` is needed because it is only valid until
+        // the next row fetch.
         let val_ref = self.value_ref(self.current_row, idx);
         Ok(val_ref)
     }
 
     fn value_ref(&self, row: usize, col: usize) -> ValueRef<'_> {
         let column = self.arr.as_ref().as_ref().unwrap().column(col);
-        Self::value_ref_internal(row, col, column)
+        let value = Self::value_ref_internal(row, column);
+
+        // Some DuckDB logical types share Arrow physical carriers. Executed
+        // result metadata recovers those DuckDB type tags.
+        match value {
+            ValueRef::Blob(bytes) => match self.stmt.result_column_logical_id(col) {
+                Some(LogicalTypeId::Geometry) => ValueRef::Geometry(bytes),
+                _ => ValueRef::Blob(bytes),
+            },
+            // Arrow gives HUGEINT, UHUGEINT, and DECIMAL(38,0) the same
+            // Decimal128(38,0) physical shape. value_ref_internal keeps that
+            // ambiguous shape in the signed HugeInt carrier. Top-level result
+            // metadata recovers UHUGEINT and DECIMAL; otherwise preserve the
+            // existing HugeInt fallback for parameter-derived or metadata-less
+            // results.
+            ValueRef::HugeInt(value) => match self.stmt.result_column_logical_id(col) {
+                Some(LogicalTypeId::UHugeint) => ValueRef::UHugeInt(value as u128),
+                Some(LogicalTypeId::Decimal) => {
+                    if let DataType::Decimal128(width, 0) = column.data_type() {
+                        decimal_value_ref(*width, 0, value)
+                    } else {
+                        ValueRef::HugeInt(value)
+                    }
+                }
+                _ => ValueRef::HugeInt(value),
+            },
+            value => value,
+        }
     }
 
-    pub(crate) fn value_ref_internal(row: usize, col: usize, column: &ArrayRef) -> ValueRef<'_> {
+    pub(crate) fn value_ref_internal<'a>(row: usize, column: &'a ArrayRef) -> ValueRef<'a> {
         if column.is_null(row) {
             return ValueRef::Null;
         }
@@ -448,13 +474,24 @@ impl<'stmt> Row<'stmt> {
                 let array = column.as_any().downcast_ref::<array::Float64Array>().unwrap();
                 ValueRef::Double(array.value(row))
             }
-            DataType::Decimal128(..) => {
+            DataType::Decimal32(width, scale) => {
+                let array = column.as_any().downcast_ref::<array::Decimal32Array>().unwrap();
+                let value = i128::from(array.value(row));
+                decimal_value_ref(*width, *scale, value)
+            }
+            DataType::Decimal64(width, scale) => {
+                let array = column.as_any().downcast_ref::<array::Decimal64Array>().unwrap();
+                let value = i128::from(array.value(row));
+                decimal_value_ref(*width, *scale, value)
+            }
+            DataType::Decimal128(width, scale) => {
                 let array = column.as_any().downcast_ref::<array::Decimal128Array>().unwrap();
-                // hugeint: d:38,0
-                if array.scale() == 0 {
-                    return ValueRef::HugeInt(array.value(row));
+                let value = array.value(row);
+                if *scale == 0 && *width == Decimal::MAX_WIDTH {
+                    ValueRef::HugeInt(value)
+                } else {
+                    decimal_value_ref(*width, *scale, value)
                 }
-                ValueRef::Decimal(Decimal::from_i128_with_scale(array.value(row), array.scale() as u32))
             }
             DataType::Timestamp(unit, _) if *unit == TimeUnit::Second => {
                 let array = column.as_any().downcast_ref::<array::TimestampSecondArray>().unwrap();
@@ -558,7 +595,7 @@ impl<'stmt> Row<'stmt> {
                 ValueRef::Array(arr, row)
             }
             DataType::Union(..) => ValueRef::Union(column, row),
-            _ => unreachable!("invalid value: {}, {}", col, column.data_type()),
+            _ => unreachable!("invalid value: {}", column.data_type()),
         }
     }
 
@@ -624,21 +661,31 @@ impl RowIndex for &'_ str {
 }
 
 macro_rules! tuple_try_from_row {
-    ($($field:ident),*) => {
+    () => {
+        impl<'a> convert::TryFrom<&'a Row<'a>> for () {
+            type Error = crate::Error;
+
+            fn try_from(_: &'a Row<'a>) -> Result<Self> {
+                Ok(())
+            }
+        }
+    };
+    ($($field:ident),+) => {
         impl<'a, $($field,)*> convert::TryFrom<&'a Row<'a>> for ($($field,)*) where $($field: FromSql,)* {
             type Error = crate::Error;
 
-            // we end with index += 1, which rustc warns about
-            // unused_variables and unused_mut are allowed for ()
-            #[allow(unused_assignments, unused_variables, unused_mut)]
             fn try_from(row: &'a Row<'a>) -> Result<Self> {
                 let mut index = 0;
-                $(
-                    #[allow(non_snake_case)]
-                    let $field = row.get::<_, $field>(index)?;
-                    index += 1;
-                )*
-                Ok(($($field,)*))
+                let values = (
+                    $({
+                        let value = row.get::<_, $field>(index)?;
+                        index += 1;
+                        value
+                    },)*
+                );
+                // Read the final increment so rustc does not flag it as an unused assignment.
+                let _ = index;
+                Ok(values)
             }
         }
     }
@@ -659,8 +706,24 @@ tuples_try_from_row!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::redundant_closure)] // false positives due to lifetime issues; clippy issue #5594
-    use crate::{Connection, Result};
+    use crate::{
+        Connection, Error, Result,
+        types::{Decimal, Type, Value, ValueRef},
+    };
+
+    const U128_MAX_SQL: &str = "340282366920938463463374607431768211455";
+    const I128_MAX_PLUS_ONE_SQL: &str = "170141183460469231731687303715884105728";
+    const WIDE_DECIMAL_SQL: &str = "123456789012345678901234567890.12";
+    const WIDE_DECIMAL_MANTISSA: i128 = 12_345_678_901_234_567_890_123_456_789_012;
+
+    #[test]
+    fn test_try_from_row_for_tuple_0() -> Result<()> {
+        use std::convert::TryFrom;
+
+        let conn = Connection::open_in_memory()?;
+        conn.query_row("SELECT 1", [], |row| <()>::try_from(row))?;
+        Ok(())
+    }
 
     #[test]
     fn test_try_from_row_for_tuple_1() -> Result<()> {
@@ -691,6 +754,16 @@ mod tests {
         assert_eq!(val, (42, 47));
         let fail = conn.query_row("SELECT a, b FROM test", [], |row| <(u32, u32, u32)>::try_from(row));
         assert!(fail.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_from_row_for_tuple_3() -> Result<()> {
+        use std::convert::TryFrom;
+
+        let conn = Connection::open_in_memory()?;
+        let val = conn.query_row("SELECT 3, 5, 8", [], |row| <(u32, u32, u32)>::try_from(row))?;
+        assert_eq!(val, (3, 5, 8));
         Ok(())
     }
 
@@ -782,9 +855,372 @@ mod tests {
     }
 
     #[test]
+    fn uhugeint_arrives_as_uhugeint() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let mut stmt = db.prepare("SELECT (1)::UHUGEINT")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref(0)?, ValueRef::UHugeInt(1));
+        assert_eq!(row.get_ref(0)?.data_type(), Type::UHugeInt);
+        assert_eq!(row.get::<_, u128>(0)?, 1);
+
+        let mut stmt = db.prepare(&format!("SELECT ({U128_MAX_SQL})::UHUGEINT"))?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref(0)?, ValueRef::UHugeInt(u128::MAX));
+        assert_eq!(row.get_ref(0)?.data_type(), Type::UHugeInt);
+        assert_eq!(row.get::<_, u128>(0)?, u128::MAX);
+
+        let i128_max_plus_one = (i128::MAX as u128) + 1;
+        let mut stmt = db.prepare(&format!("SELECT ({I128_MAX_PLUS_ONE_SQL})::UHUGEINT"))?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref(0)?, ValueRef::UHugeInt(i128_max_plus_one));
+        assert_eq!(row.get::<_, u128>(0)?, i128_max_plus_one);
+
+        Ok(())
+    }
+
+    #[test]
+    fn uhugeint_promotion_uses_matching_result_column() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let mut stmt = db.prepare(&format!(
+            "
+            SELECT
+                1::HUGEINT AS a,
+                2::UHUGEINT AS b,
+                3::DECIMAL(38,0) AS c,
+                ({U128_MAX_SQL})::UHUGEINT AS d
+            "
+        ))?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.unwrap();
+
+        assert_eq!(row.get_ref(0)?, ValueRef::HugeInt(1));
+        assert_eq!(row.get_ref(1)?, ValueRef::UHugeInt(2));
+        assert_eq!(row.get_ref(2)?, ValueRef::Decimal(Decimal::new(38, 0, 3)?));
+        assert_eq!(row.get_ref(3)?, ValueRef::UHugeInt(u128::MAX));
+
+        Ok(())
+    }
+
+    #[test]
+    fn bound_uhugeint_result_uses_logical_metadata_when_cast() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let max = u128::MAX;
+
+        let value = db.query_row("SELECT ?::UHUGEINT", [&max], |row| {
+            assert_eq!(row.get_ref(0)?, ValueRef::UHugeInt(max));
+            row.get::<_, u128>(0)
+        })?;
+        assert_eq!(value, max);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_decimal_expression_uses_executed_metadata() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let byte = 255_i128;
+        let byte_value = db.query_row("SELECT ?", [&byte], |row| {
+            assert_eq!(row.get_ref(0)?, ValueRef::HugeInt(byte));
+            row.get::<_, u8>(0)
+        })?;
+        assert_eq!(byte_value, 255);
+
+        let value = 5_u128;
+        let decimal = db.query_row("SELECT ? + 0::DECIMAL(38,0)", [&value], |row| {
+            row.get_ref(0).map(|value| value.to_owned())
+        })?;
+        assert_eq!(decimal, Value::Decimal(Decimal::new(38, 0, 5)?));
+
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_columns_use_native_decimal_carrier() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let value = db.query_row("SELECT 1.23::DECIMAL(38,2)", [], |row| {
+            row.get_ref(0).map(|value| value.to_owned())
+        })?;
+        assert_eq!(value, Value::Decimal(Decimal::new(38, 2, 123)?));
+
+        let value = db.query_row("SELECT 3::DECIMAL(38,0)", [], |row| {
+            row.get_ref(0).map(|value| value.to_owned())
+        })?;
+        match value {
+            Value::Decimal(decimal) => {
+                assert_eq!(decimal.width(), 38);
+                assert_eq!(decimal, Decimal::new(38, 0, 3)?);
+            }
+            other => panic!("expected decimal, got {other:?}"),
+        }
+
+        let decimal = db.query_row(&format!("SELECT {WIDE_DECIMAL_SQL}::DECIMAL(38,2)"), [], |row| {
+            assert_eq!(
+                row.get_ref(0)?,
+                ValueRef::Decimal(Decimal::new(38, 2, WIDE_DECIMAL_MANTISSA)?)
+            );
+            row.get::<_, Decimal>(0)
+        })?;
+        assert_eq!(decimal, Decimal::new(38, 2, WIDE_DECIMAL_MANTISSA)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_arrow_decimal_columns_use_native_decimal_carrier() -> Result<()> {
+        use arrow::datatypes::DataType;
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("SET arrow_output_version = '1.5'")?;
+
+        {
+            let mut stmt = db.prepare("SELECT 1.23::DECIMAL(9,2) AS d32, 1.23::DECIMAL(18,2) AS d64")?;
+            let batch = stmt.query_arrow([])?.next().expect("no record batch");
+            assert_eq!(batch.column(0).data_type(), &DataType::Decimal32(9, 2));
+            assert_eq!(batch.column(1).data_type(), &DataType::Decimal64(18, 2));
+        }
+
+        let value = db.query_row("SELECT 1.23::DECIMAL(9,2)", [], |row| {
+            row.get_ref(0).map(|value| value.to_owned())
+        })?;
+        assert_eq!(value, Value::Decimal(Decimal::new(9, 2, 123)?));
+
+        let value = db.query_row("SELECT 1.23::DECIMAL(18,2)", [], |row| {
+            row.get_ref(0).map(|value| value.to_owned())
+        })?;
+        assert_eq!(value, Value::Decimal(Decimal::new(18, 2, 123)?));
+
+        Ok(())
+    }
+
+    #[test]
+    fn uhugeint_upper_half_is_out_of_range_for_i128() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let err = db
+            .query_row(&format!("SELECT ({I128_MAX_PLUS_ONE_SQL})::UHUGEINT"), [], |row| {
+                row.get::<_, i128>(0)
+            })
+            .unwrap_err();
+
+        match err {
+            Error::UnsignedIntegralValueOutOfRange(0, value) => {
+                assert_eq!(value, (i128::MAX as u128) + 1)
+            }
+            other => panic!("expected unsigned out-of-range error, got {other:?}"),
+        }
+
+        let err = db
+            .query_row(&format!("SELECT ({U128_MAX_SQL})::UHUGEINT"), [], |row| {
+                row.get::<_, i128>(0)
+            })
+            .unwrap_err();
+
+        match err {
+            Error::UnsignedIntegralValueOutOfRange(0, value) => assert_eq!(value, u128::MAX),
+            other => panic!("expected unsigned out-of-range error, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_uhugeint_uses_metadata_less_hugeint_carrier() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let list = db.query_row(&format!("SELECT [({U128_MAX_SQL})::UHUGEINT]"), [], |row| {
+            let value = row.get_ref(0)?;
+            assert!(matches!(value.data_type(), Type::List(ref inner) if **inner == Type::Decimal));
+            Ok(value.to_owned())
+        })?;
+
+        assert_eq!(list, Value::List(vec![Value::HugeInt(-1)]));
+
+        let structure = db.query_row(
+            &format!("SELECT struct_pack(v := ({U128_MAX_SQL})::UHUGEINT)"),
+            [],
+            |row| {
+                let value = row.get_ref(0)?;
+                assert!(matches!(value.data_type(), Type::Struct(_)));
+                Ok(value.to_owned())
+            },
+        )?;
+
+        match structure {
+            Value::Struct(fields) => {
+                assert_eq!(fields.get(&"v".to_string()), Some(&Value::HugeInt(-1)));
+            }
+            other => panic!("expected struct, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_scale_zero_decimal_uses_decimal_when_width_is_unambiguous() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let list = db.query_row("SELECT [3::DECIMAL(5,0)]", [], |row| {
+            let value = row.get_ref(0)?;
+            assert!(matches!(value.data_type(), Type::List(ref inner) if **inner == Type::Decimal));
+            Ok(value.to_owned())
+        })?;
+
+        assert_eq!(list, Value::List(vec![Value::Decimal(Decimal::new(5, 0, 3)?)]));
+
+        let structure = db.query_row("SELECT struct_pack(a := 1.5::DECIMAL(5,1))", [], |row| {
+            let value = row.get_ref(0)?;
+            assert!(matches!(value.data_type(), Type::Struct(_)));
+            Ok(value.to_owned())
+        })?;
+
+        match structure {
+            Value::Struct(fields) => {
+                assert_eq!(
+                    fields.get(&"a".to_string()),
+                    Some(&Value::Decimal(Decimal::new(5, 1, 15)?))
+                );
+            }
+            other => panic!("expected struct, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_decimal_38_0_keeps_metadata_less_hugeint_fallback() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let list = db.query_row("SELECT [3::DECIMAL(38,0)]", [], |row| {
+            let value = row.get_ref(0)?;
+            assert!(matches!(value.data_type(), Type::List(ref inner) if **inner == Type::Decimal));
+            Ok(value.to_owned())
+        })?;
+
+        assert_eq!(list, Value::List(vec![Value::HugeInt(3)]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_geometry_uses_metadata_less_blob_carrier() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let top_level = db.query_row("SELECT 'POINT EMPTY'::GEOMETRY", [], |row| {
+            Ok(row.get_ref(0)?.to_owned())
+        })?;
+        assert!(matches!(top_level, Value::Geometry(_)));
+
+        let list = db.query_row("SELECT ['POINT EMPTY'::GEOMETRY]", [], |row| {
+            let value = row.get_ref(0)?;
+            assert!(matches!(value.data_type(), Type::List(ref inner) if **inner == Type::Blob));
+            Ok(value.to_owned())
+        })?;
+
+        assert!(matches!(list, Value::List(ref values) if matches!(values.as_slice(), [Value::Blob(_)])));
+        Ok(())
+    }
+
+    #[test]
+    fn uhugeint_logical_type_cache_survives_later_batches() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let values = db
+            .prepare(
+                "
+                SELECT
+                    CASE
+                        WHEN i = 2500 THEN NULL::UHUGEINT
+                        ELSE i::UHUGEINT
+                    END AS v
+                FROM range(3000) AS t(i)
+                ORDER BY i
+                ",
+            )?
+            .query_map([], |row| row.get_ref(0).map(|value| value.to_owned()))?
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(values.len(), 3000);
+        assert_eq!(values[0], Value::UHugeInt(0));
+        assert_eq!(values[2048], Value::UHugeInt(2048));
+        assert_eq!(values[2500], Value::Null);
+        assert_eq!(values[2999], Value::UHugeInt(2999));
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_row_query_returns_none() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("SELECT 1 AS x WHERE false")?;
+        let mut rows = stmt.query([])?;
+
+        assert!(rows.next()?.is_none());
+        assert!(rows.next()?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn wide_multichunk_query_iterates_all_rows() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let columns = (0..64)
+            .map(|idx| format!("i + {idx} AS c{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {columns} FROM range(3000) AS t(i) ORDER BY i");
+        let mut stmt = db.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut count = 0_i64;
+
+        while let Some(row) = rows.next()? {
+            assert_eq!(row.get::<_, i64>(0)?, count);
+            assert_eq!(row.get::<_, i64>(63)?, count + 63);
+            count += 1;
+        }
+
+        assert_eq!(count, 3000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn uhugeint_nulls_use_cached_logical_type() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        let values = db
+            .prepare(&format!(
+                "
+                SELECT v FROM (
+                    VALUES
+                        (0, (0)::UHUGEINT),
+                        (1, NULL::UHUGEINT),
+                        (2, ({U128_MAX_SQL})::UHUGEINT)
+                ) AS t(ord, v)
+                ORDER BY ord
+                "
+            ))?
+            .query_map([], |row| row.get_ref(0).map(|value| value.to_owned()))?
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(
+            values,
+            vec![Value::UHugeInt(0), Value::Null, Value::UHugeInt(u128::MAX)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     #[cfg(feature = "vtab-arrow")]
     fn test_fixed_size_binary_via_arrow() -> Result<()> {
-        use crate::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
+        use crate::vtab::arrow::{ArrowBatchRegistration, ArrowVTab};
         use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -805,8 +1241,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("data", DataType::FixedSizeBinary(16), false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![arc]).unwrap();
 
-        let mut stmt = conn.prepare("SELECT data FROM arrow(?, ?)")?;
-        let mut arr = stmt.query_arrow(arrow_recordbatch_to_query_params(batch))?;
+        let mut stmt = conn.prepare("SELECT data FROM arrow(?)")?;
+        let mut arr = stmt.query_arrow([&ArrowBatchRegistration::new(batch)])?;
         let rb = arr.next().expect("no record batch");
 
         // DuckDB converts FixedSizeBinary to regular Binary
@@ -828,7 +1264,7 @@ mod tests {
     #[test]
     #[cfg(feature = "vtab-arrow")]
     fn test_fixed_size_binary_with_nulls_via_arrow() -> Result<()> {
-        use crate::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
+        use crate::vtab::arrow::{ArrowBatchRegistration, ArrowVTab};
         use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -849,22 +1285,16 @@ mod tests {
         let schema = Schema::new(vec![Field::new("data", DataType::FixedSizeBinary(8), true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![arc]).unwrap();
 
-        let mut stmt = conn.prepare("SELECT data FROM arrow(?, ?)")?;
-        let mut arr = stmt.query_arrow(arrow_recordbatch_to_query_params(batch))?;
+        let mut stmt = conn.prepare("SELECT data FROM arrow(?)")?;
+        let mut arr = stmt.query_arrow([&ArrowBatchRegistration::new(batch)])?;
         let rb = arr.next().expect("no record batch");
 
-        // NOTE: Currently, null handling for FixedSizeBinary is not fully implemented
-        // (see vtab/arrow.rs fixed_size_binary_array_to_vector, line 925-926)
-        // Nulls are converted to zero bytes instead of actual nulls
         let column = rb.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(column.len(), 3);
         assert!(column.is_valid(0));
-        // This should be false when null handling is implemented
-        // assert!(!column.is_valid(1));
+        assert!(!column.is_valid(1));
         assert!(column.is_valid(2));
         assert_eq!(column.value(0), &[1u8, 2, 3, 4, 5, 6, 7, 8]);
-        // The null value is currently represented as zero bytes
-        assert_eq!(column.value(1), &[0u8, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(column.value(2), &[9u8, 10, 11, 12, 13, 14, 15, 16]);
 
         Ok(())
@@ -873,7 +1303,7 @@ mod tests {
     #[test]
     #[cfg(feature = "vtab-arrow")]
     fn test_fixed_size_binary_different_sizes_via_arrow() -> Result<()> {
-        use crate::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
+        use crate::vtab::arrow::{ArrowBatchRegistration, ArrowVTab};
         use arrow::array::{ArrayRef, FixedSizeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -890,8 +1320,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("data", DataType::FixedSizeBinary(4), false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![arc]).unwrap();
 
-        let mut stmt = conn.prepare("SELECT data FROM arrow(?, ?)")?;
-        let mut rows = stmt.query(arrow_recordbatch_to_query_params(batch))?;
+        let mut stmt = conn.prepare("SELECT data FROM arrow(?)")?;
+        let mut rows = stmt.query([&ArrowBatchRegistration::new(batch)])?;
 
         // Read via Row interface
         let row = rows.next()?.unwrap();
@@ -909,7 +1339,7 @@ mod tests {
     #[cfg(feature = "vtab-arrow")]
     fn test_fixed_size_binary_value_ref_via_arrow() -> Result<()> {
         use crate::types::ValueRef;
-        use crate::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
+        use crate::vtab::arrow::{ArrowBatchRegistration, ArrowVTab};
         use arrow::array::{ArrayRef, FixedSizeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -925,8 +1355,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("data", DataType::FixedSizeBinary(4), true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![arc]).unwrap();
 
-        let mut stmt = conn.prepare("SELECT data FROM arrow(?, ?)")?;
-        let mut rows = stmt.query(arrow_recordbatch_to_query_params(batch))?;
+        let mut stmt = conn.prepare("SELECT data FROM arrow(?)")?;
+        let mut rows = stmt.query([&ArrowBatchRegistration::new(batch)])?;
 
         // First row - non-null
         let row = rows.next()?.unwrap();
@@ -938,17 +1368,12 @@ mod tests {
             _ => panic!("Expected Blob ValueRef, got {:?}", value_ref),
         }
 
-        // Second row - should be null, but currently null handling is not implemented
-        // (see vtab/arrow.rs fixed_size_binary_array_to_vector, line 925-926)
-        // so it's represented as zero bytes
+        // Second row - null
         let row = rows.next()?.unwrap();
         let value_ref = row.get_ref(0)?;
         match value_ref {
-            ValueRef::Blob(bytes) => {
-                // This should be ValueRef::Null when null handling is implemented
-                assert_eq!(bytes, &[0u8, 0, 0, 0]);
-            }
-            _ => panic!("Expected Blob ValueRef with zero bytes, got {:?}", value_ref),
+            ValueRef::Null => {}
+            _ => panic!("Expected Null ValueRef, got {:?}", value_ref),
         }
 
         Ok(())

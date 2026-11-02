@@ -1,4 +1,4 @@
-use duckdb::{params, Connection, DropBehavior, Result};
+use duckdb::{Connection, DropBehavior, Result, params};
 
 fn main() -> Result<()> {
     //let mut db = Connection::open("10m.db")?;
@@ -19,11 +19,6 @@ fn main() -> Result<()> {
         let mut tx = db.transaction()?;
         tx.set_drop_behavior(DropBehavior::Commit);
         let mut app = tx.appender("test")?;
-        // use generator
-        // for u in firstn(1_000_000) {
-        //     app.append_row(params![u.id, u.area, u.age, u.active])?;
-        // }
-
         for i in 0..row_count {
             app.append_row(params![
                 i,
@@ -39,33 +34,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-struct User {
-    id: i32,
-    area: Option<String>,
-    age: i8,
-    active: i8,
-}
-
-#[allow(dead_code)]
-fn firstn(n: i32) -> impl std::iter::Iterator<Item = User> {
-    let mut id = 0;
-    std::iter::from_fn(move || {
-        if id >= n {
-            return None;
-        }
-        id += 1;
-        Some(User {
-            id,
-            area: get_random_area_code(),
-            age: get_random_age(),
-            active: get_random_active(),
-        })
-    })
-}
-
 // Modified from https://github.com/avinassh/fast-sqlite3-inserts/blob/master/src/bin/common.rs
-use rand::{prelude::IndexedRandom, Rng};
+use rand::{Rng, prelude::IndexedRandom};
 
 #[inline]
 fn get_random_age() -> i8 {

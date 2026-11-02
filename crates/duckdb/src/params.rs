@@ -1,4 +1,9 @@
-use crate::{Result, Statement, ToSql};
+use crate::{Error, Result, Statement, ToSql};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+    hash::{BuildHasher, Hash},
+};
 
 mod sealed {
     /// This trait exists just to ensure that the only impls of `trait Params`
@@ -49,6 +54,10 @@ use sealed::Sealed;
 ///       hence why the number of parameters must be <= 32 or you need to
 ///       reach for `duckdb::params!`)
 ///
+///     - a tuple of mixed types (up to 16 elements), as in
+///       `thing.execute((1i32, "foo", 3.14f64))`. This is the most ergonomic
+///       way to pass heterogeneous parameters.
+///
 ///   Unfortunately, in the current design it's not possible to allow this for
 ///   references to arrays of non-references (e.g. `&[1i32, 2, 3]`). Code like
 ///   this should instead either use `params!`, an array literal, a `&[&dyn
@@ -80,25 +89,74 @@ use sealed::Sealed;
 ///     // Note: The types behind the references don't have to be `Sized`
 ///     stmt.execute(&["foo", "bar"])?;
 ///
+///     // Tuple of mixed types:
+///     stmt.execute((1i32, "blah"))?;
+///
 ///     // However, this doesn't work (see above):
 ///     // stmt.execute(&[1i32, 2i32])?;
 ///     Ok(())
 /// }
 /// ```
 ///
+/// ## Named parameters
+///
+/// Named parameters can be passed using [`duckdb::named_params!`](crate::named_params!)
+/// or a manually constructed `&[(&str, &dyn ToSql)]` for heterogeneous values,
+/// or as any `HashMap` whose keys borrow as `str` and whose values implement a
+/// single concrete [`ToSql`] type, including maps with custom hashers. The keys
+/// must not include the `$` prefix. Named-parameter APIs must be used with
+/// named SQL placeholders such as `$name`, not positional placeholders such as
+/// `?` or `?1`.
+///
+/// Returns [`Error::InvalidParameterName`](crate::Error::InvalidParameterName)
+/// if a SQL placeholder has no matching key, a provided key is not present in
+/// the SQL, slice parameters contain duplicate keys, or positional placeholders
+/// are used with named-parameter APIs.
+///
+/// ### Example (named parameters with a HashMap)
+///
+/// ```rust,no_run
+/// use std::collections::HashMap;
+/// use duckdb::{Connection, Result};
+///
+/// fn execute_query(conn: &Connection) -> Result<Vec<String>> {
+///     let params = HashMap::from([("min", 23), ("max", 42)]);
+///     let mut stmt = conn.prepare("SELECT name FROM people WHERE age BETWEEN $min AND $max")?;
+///     let rows = stmt.query_map(&params, |row| row.get::<_, String>(0))?;
+///     rows.collect()
+/// }
+/// ```
+///
+/// ### Example (named parameters with mixed types)
+///
+/// ```rust,no_run
+/// use duckdb::{Connection, Result, named_params};
+///
+/// fn execute_query(conn: &Connection, min_age: i32, name: &str) -> Result<bool> {
+///     conn.query_row(
+///         "SELECT $name = 'Alice' AND $age >= 18",
+///         named_params! {
+///             "name": name,
+///             "age": min_age,
+///         },
+///         |row| row.get(0),
+///     )
+/// }
+/// ```
+///
 /// ## No parameters
 ///
-/// You can just use an empty array literal for no params. The
-/// `duckdb::NO_PARAMS` constant which was so common in previous versions of
-/// this library is no longer needed (and is now deprecated).
+/// You can use an empty array literal or the empty tuple for no params.
 ///
 /// ### Example (no parameters)
 ///
 /// ```rust,no_run
 /// # use duckdb::{Connection, Result, params};
 /// fn delete_all_users(conn: &Connection) -> Result<()> {
-///     // Just use an empty array (e.g. `[]`) for no params.
+///     // Empty array:
 ///     conn.execute("DELETE FROM users", [])?;
+///     // Or empty tuple:
+///     conn.execute("DELETE FROM users", ())?;
 ///     Ok(())
 /// }
 /// ```
@@ -141,6 +199,15 @@ impl Params for [&dyn ToSql; 0] {
     }
 }
 
+// Empty tuple — allows `conn.execute("...", ())`.
+impl Sealed for () {}
+impl Params for () {
+    #[inline]
+    fn __bind_in(self, stmt: &mut Statement<'_>) -> Result<()> {
+        stmt.bind_parameters(&[] as &[&dyn ToSql])
+    }
+}
+
 impl Sealed for &[&dyn ToSql] {}
 impl Params for &[&dyn ToSql] {
     #[inline]
@@ -174,8 +241,39 @@ macro_rules! impl_for_array_ref {
 // note above the impl of `[&dyn ToSql; 0]` for more information.
 impl_for_array_ref!(
     1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17
-    18 19 20 21 22 23 24 25 26 27 29 30 31 32
+    18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
 );
+
+macro_rules! impl_params_for_tuple {
+    ($($T:ident),+) => {
+        impl<$($T: ToSql),+> Sealed for ($($T,)+) {}
+        impl<$($T: ToSql),+> Params for ($($T,)+) {
+            fn __bind_in(self, stmt: &mut Statement<'_>) -> Result<()> {
+                #[allow(non_snake_case)]
+                let ($($T,)+) = &self;
+                stmt.bind_parameters(&[$($T as &dyn ToSql),+])
+            }
+        }
+    };
+}
+
+// Implement Params for tuples up to arity 16, matching rusqlite.
+impl_params_for_tuple!(T1);
+impl_params_for_tuple!(T1, T2);
+impl_params_for_tuple!(T1, T2, T3);
+impl_params_for_tuple!(T1, T2, T3, T4);
+impl_params_for_tuple!(T1, T2, T3, T4, T5);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15);
+impl_params_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16);
 
 /// Adapter type which allows any iterator over [`ToSql`] values to implement
 /// [`Params`].
@@ -256,17 +354,10 @@ impl_for_array_ref!(
 /// That is fairly complex, and even so would need even more work to be fully
 /// production-ready:
 ///
-/// - production code should ensure `usernames` isn't so large that it will
-///   surpass [`conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)`][limits]),
-///   chunking if too large. (Note that the limits api requires duckdb to have
-///   the "limits" feature).
-///
 /// - `repeat_vars` can be implemented in a way that avoids needing to allocate
 ///   a String.
 ///
 /// - Etc...
-///
-/// [limits]: crate::Connection::limit
 ///
 /// This complexity reflects the fact that `ParamsFromIter` is mainly intended
 /// for advanced use cases — most of the time you should know how many
@@ -301,5 +392,90 @@ where
     #[inline]
     fn __bind_in(self, stmt: &mut Statement<'_>) -> Result<()> {
         stmt.bind_parameters(self.0)
+    }
+}
+
+fn reject_positional(name: &str) -> Result<()> {
+    if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::InvalidParameterName(format!(
+            "positional parameter {name} cannot be used with named parameters"
+        )));
+    }
+    Ok(())
+}
+
+impl Sealed for &[(&str, &dyn ToSql)] {}
+
+impl Params for &[(&str, &dyn ToSql)] {
+    fn __bind_in(self, stmt: &mut Statement<'_>) -> Result<()> {
+        let n = stmt.parameter_count();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.len());
+        for (key, _) in self {
+            if !seen.insert(*key) {
+                return Err(Error::InvalidParameterName(format!("duplicate parameter name: {key}")));
+            }
+        }
+
+        let mut params = Vec::with_capacity(n);
+        let mut used = vec![false; self.len()];
+        for i in 1..=n {
+            let name = stmt.parameter_name(i)?;
+            reject_positional(&name)?;
+            let (idx, value) = self
+                .iter()
+                .enumerate()
+                .find_map(|(idx, (key, value))| (*key == name).then_some((idx, *value)))
+                .ok_or(Error::InvalidParameterName(name))?;
+            used[idx] = true;
+            params.push(value);
+        }
+
+        if let Some(idx) = used.iter().position(|u| !u) {
+            return Err(Error::InvalidParameterName(self[idx].0.to_string()));
+        }
+
+        stmt.bind_parameters(params)
+    }
+}
+
+impl<K, V, S> Sealed for &HashMap<K, V, S>
+where
+    K: Borrow<str> + Eq + Hash,
+    V: ToSql,
+    S: BuildHasher,
+{
+}
+
+impl<K, V, S> Params for &HashMap<K, V, S>
+where
+    K: Borrow<str> + Eq + Hash,
+    V: ToSql,
+    S: BuildHasher,
+{
+    fn __bind_in(self, stmt: &mut Statement<'_>) -> Result<()> {
+        let n = stmt.parameter_count();
+        let mut params = Vec::with_capacity(n);
+        let mut bound: HashSet<&str> = HashSet::with_capacity(n);
+        for i in 1..=n {
+            let name = stmt.parameter_name(i)?;
+            reject_positional(&name)?;
+            let (key, value) = self
+                .get_key_value(name.as_str())
+                .ok_or(Error::InvalidParameterName(name))?;
+            bound.insert(key.borrow());
+            params.push(value as &dyn ToSql);
+        }
+
+        // HashMap iteration order is arbitrary, so choose a stable extra key for diagnostics.
+        if let Some(extra) = self
+            .keys()
+            .map(|key| -> &str { key.borrow() })
+            .filter(|key| !bound.contains(*key))
+            .min()
+        {
+            return Err(Error::InvalidParameterName(extra.to_string()));
+        }
+
+        stmt.bind_parameters(params)
     }
 }

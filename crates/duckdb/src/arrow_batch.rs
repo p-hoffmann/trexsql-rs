@@ -1,9 +1,20 @@
+use std::iter::FusedIterator;
+
 use super::{
+    Result, Statement,
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
-    Statement,
 };
 
-/// A handle for the resulting RecordBatch of a query.
+/// A handle for iterating the [`RecordBatch`]es of a query result.
+///
+/// The iterator is lazy: each batch is fetched only as the iterator is
+/// advanced. Whether the full result is materialized up front or fetched
+/// lazily in chunks depends on how the statement was executed — see
+/// [`query_arrow`](Statement::query_arrow) and
+/// [`stream_arrow`](Statement::stream_arrow).
+///
+/// The iterator panics if DuckDB fails to fetch a result chunk or convert it
+/// to Arrow.
 #[must_use = "Arrow is lazy and will do nothing unless consumed"]
 pub struct Arrow<'stmt> {
     pub(crate) stmt: Option<&'stmt Statement<'stmt>>,
@@ -16,10 +27,13 @@ impl<'stmt> Arrow<'stmt> {
         Arrow { stmt: Some(stmt) }
     }
 
-    /// return arrow schema
+    /// Return the Arrow schema reported by DuckDB after execution.
     #[inline]
     pub fn get_schema(&self) -> SchemaRef {
-        self.stmt.unwrap().stmt.schema()
+        self.stmt
+            .expect("Arrow iterator always holds a statement")
+            .stmt
+            .schema()
     }
 }
 
@@ -28,40 +42,58 @@ impl<'stmt> Iterator for Arrow<'stmt> {
     type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(RecordBatch::from(&self.stmt?.step()?))
+        match self.stmt?.step() {
+            Ok(Some(array)) => Some(RecordBatch::from(&array)),
+            Ok(None) => None,
+            Err(err) => panic!("Failed to fetch Arrow record batch: {err}"),
+        }
     }
 }
 
-/// A handle for the resulting RecordBatch of a query in streaming
+/// A handle for iterating the [`RecordBatch`]es of a streaming query.
+///
+/// Unlike [`Arrow`], fetch and conversion errors are returned as [`Result`]
+/// items instead of panicking. After an error the iterator is exhausted.
 #[must_use = "Arrow stream is lazy and will not fetch data unless consumed"]
-#[allow(clippy::needless_lifetimes)]
 pub struct ArrowStream<'stmt> {
-    pub(crate) stmt: Option<&'stmt Statement<'stmt>>,
-    pub(crate) schema: SchemaRef,
+    stmt: &'stmt Statement<'stmt>,
+    done: bool,
 }
 
 #[allow(clippy::needless_lifetimes)]
 impl<'stmt> ArrowStream<'stmt> {
     #[inline]
-    pub(crate) fn new(stmt: &'stmt Statement<'stmt>, schema: SchemaRef) -> Self {
-        ArrowStream {
-            stmt: Some(stmt),
-            schema,
-        }
+    pub(crate) fn new(stmt: &'stmt Statement<'stmt>) -> Self {
+        ArrowStream { stmt, done: false }
     }
 
-    /// return arrow schema
+    /// Return the Arrow schema reported by DuckDB after execution.
     #[inline]
     pub fn get_schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.stmt.stmt.schema()
     }
 }
 
 #[allow(clippy::needless_lifetimes)]
 impl<'stmt> Iterator for ArrowStream<'stmt> {
-    type Item = RecordBatch;
+    type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(RecordBatch::from(&self.stmt?.stream_step(self.get_schema())?))
+        if self.done {
+            return None;
+        }
+        match self.stmt.step() {
+            Ok(Some(array)) => Some(Ok(RecordBatch::from(&array))),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
+
+impl FusedIterator for ArrowStream<'_> {}

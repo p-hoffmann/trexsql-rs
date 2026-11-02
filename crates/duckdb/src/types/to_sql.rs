@@ -1,4 +1,4 @@
-use super::{Null, TimeUnit, Value, ValueRef};
+use super::{Null, TimeUnit, Value, ValueRef, binding_unsupported_value, is_owned_container, value_ref_from_value};
 use crate::Result;
 use std::borrow::Cow;
 
@@ -7,10 +7,10 @@ use std::borrow::Cow;
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ToSqlOutput<'a> {
-    /// A borrowed SQLite-representable value.
+    /// A borrowed DuckDB-representable value.
     Borrowed(ValueRef<'a>),
 
-    /// An owned SQLite-representable value.
+    /// An owned DuckDB-representable value.
     Owned(Value),
 }
 
@@ -47,6 +47,7 @@ from_value!(i16);
 from_value!(i32);
 from_value!(i64);
 from_value!(i128);
+from_value!(u128);
 from_value!(isize);
 from_value!(u8);
 from_value!(u16);
@@ -63,15 +64,17 @@ from_value!(uuid::Uuid);
 impl ToSql for ToSqlOutput<'_> {
     #[inline]
     fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
-        Ok(match *self {
-            ToSqlOutput::Borrowed(v) => ToSqlOutput::Borrowed(v),
-            ToSqlOutput::Owned(ref v) => ToSqlOutput::Borrowed(ValueRef::from(v)),
+        Ok(match self {
+            ToSqlOutput::Borrowed(v) => ToSqlOutput::Borrowed(*v),
+            ToSqlOutput::Owned(v) if is_owned_container(v) => ToSqlOutput::Owned(v.clone()),
+            ToSqlOutput::Owned(v) => ToSqlOutput::Borrowed(value_ref_from_value(v, binding_unsupported_value)?),
         })
     }
 }
 
 /// A trait for types that can be converted into DuckDB values. Returns
-/// [`Error::ToSqlConversionFailure`] if the conversion fails.
+/// [`Error::ToSqlConversionFailure`](crate::Error::ToSqlConversionFailure) if
+/// the conversion fails.
 pub trait ToSql {
     /// Converts Rust value to DuckDB value
     fn to_sql(&self) -> Result<ToSqlOutput<'_>>;
@@ -135,6 +138,7 @@ to_sql_self!(i16);
 to_sql_self!(i32);
 to_sql_self!(i64);
 to_sql_self!(i128);
+to_sql_self!(u128);
 to_sql_self!(isize);
 to_sql_self!(u8);
 to_sql_self!(u16);
@@ -188,7 +192,13 @@ impl ToSql for [u8] {
 impl ToSql for Value {
     #[inline]
     fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self))
+        if is_owned_container(self) {
+            return Ok(ToSqlOutput::Owned(self.clone()));
+        }
+        Ok(ToSqlOutput::Borrowed(value_ref_from_value(
+            self,
+            binding_unsupported_value,
+        )?))
     }
 }
 
@@ -213,7 +223,7 @@ impl ToSql for std::time::Duration {
 
 #[cfg(test)]
 mod test {
-    use super::ToSql;
+    use super::{ToSql, ToSqlOutput};
 
     fn is_to_sql<T: ToSql>() {}
 
@@ -223,9 +233,59 @@ mod test {
         is_to_sql::<i16>();
         is_to_sql::<i32>();
         is_to_sql::<i64>();
+        is_to_sql::<i128>();
+        is_to_sql::<isize>();
         is_to_sql::<u8>();
         is_to_sql::<u16>();
         is_to_sql::<u32>();
+        is_to_sql::<u64>();
+        is_to_sql::<u128>();
+        is_to_sql::<usize>();
+    }
+
+    #[test]
+    fn test_value_to_sql_rejects_unsupported_variants() {
+        use crate::{
+            Error,
+            types::{OrderedMap, Value},
+        };
+
+        let owned = [
+            Value::List(vec![Value::Int(1)]),
+            Value::Array(vec![Value::Int(1)]),
+            Value::Struct(OrderedMap::from(vec![("k".to_string(), Value::Int(1))])),
+            Value::Map(OrderedMap::from(vec![(Value::Int(1), Value::Int(2))])),
+        ];
+        for value in &owned {
+            match value.to_sql() {
+                Ok(ToSqlOutput::Owned(got)) => assert_eq!(got, *value),
+                other => panic!("expected owned container, got {other:?}"),
+            }
+            match ToSqlOutput::Owned(value.clone()).to_sql() {
+                Ok(ToSqlOutput::Owned(got)) => assert_eq!(got, *value),
+                other => panic!("expected owned container from ToSqlOutput, got {other:?}"),
+            }
+        }
+
+        let rejected = [
+            ("Union", Value::Union(Box::new(Value::Int(1)))),
+            ("Enum", Value::Enum("variant".to_string())),
+        ];
+        for (variant, value) in &rejected {
+            for result in [value.to_sql(), ToSqlOutput::Owned(value.clone()).to_sql()] {
+                match result {
+                    Err(Error::ToSqlConversionFailure(e)) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains(&format!("binding {variant} parameters is not yet supported")),
+                            "{variant}: unexpected message {msg}"
+                        );
+                    }
+                    Err(other) => panic!("{variant}: expected ToSqlConversionFailure, got {other:?}"),
+                    Ok(_) => panic!("{variant}: expected error, got Ok"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -324,7 +384,7 @@ mod test {
     #[cfg(feature = "uuid")]
     #[test]
     fn test_uuid_blob_type() -> crate::Result<()> {
-        use crate::{params, Connection};
+        use crate::{Connection, params};
         use uuid::Uuid;
 
         let db = Connection::open_in_memory()?;
@@ -345,7 +405,7 @@ mod test {
     #[cfg(feature = "uuid")]
     #[test]
     fn test_uuid_type() -> crate::Result<()> {
-        use crate::{params, Connection};
+        use crate::{Connection, params};
         use uuid::Uuid;
 
         let db = Connection::open_in_memory()?;

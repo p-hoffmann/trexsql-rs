@@ -1,12 +1,16 @@
-use super::{Null, OrderedMap, TimeUnit, Type};
-use rust_decimal::prelude::*;
+use super::{Decimal, Null, OrderedMap, TimeUnit, Type};
 
 /// Owning [dynamic type value](https://duckdb.org/docs/stable/sql/data_types/overview.html).
 /// Value's type is typically dictated by DuckDB (not by the caller).
 ///
+/// Container variants decode child values without DuckDB child logical type
+/// metadata. See the [`crate::types`] compatibility notes for `UHUGEINT`
+/// behavior inside containers.
+///
 /// See [`ValueRef`](crate::types::ValueRef) for a non-owning dynamic type
 /// value.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// The value is a `NULL` value.
     Null,
@@ -22,6 +26,13 @@ pub enum Value {
     BigInt(i64),
     /// The value is a signed huge integer.
     HugeInt(i128),
+    /// The value is an unsigned huge integer.
+    ///
+    /// Top-level `UHUGEINT` result values materialize as this variant. Nested
+    /// `UHUGEINT` values inside lists, structs, maps, arrays, and unions do
+    /// not currently carry DuckDB child logical metadata and cannot recover
+    /// values above `i128::MAX`.
+    UHugeInt(u128),
     /// The value is a unsigned tiny integer.
     UTinyInt(u8),
     /// The value is a unsigned small integer.
@@ -34,7 +45,10 @@ pub enum Value {
     Float(f32),
     /// The value is a f64.
     Double(f64),
-    /// The value is a Decimal.
+    /// The value is a DuckDB decimal.
+    ///
+    /// [`Decimal`] stores DuckDB's decimal width, scale, and scaled integer
+    /// payload.
     Decimal(Decimal),
     /// The value is a timestamp.
     Timestamp(TimeUnit, i64),
@@ -42,6 +56,15 @@ pub enum Value {
     Text(String),
     /// The value is a blob of data
     Blob(Vec<u8>),
+    /// The value is a `GEOMETRY`, represented as WKB bytes.
+    ///
+    /// As of the bundled DuckDB version, DuckDB does not expose a dedicated
+    /// geometry bind or appender helper. Binding or appending this variant
+    /// routes its WKB bytes through the BLOB APIs, and DuckDB casts them to
+    /// `GEOMETRY` where the target is a `GEOMETRY` column or parameter. See
+    /// [`ValueRef::Geometry`](super::ValueRef::Geometry) for borrowed geometry
+    /// values.
+    Geometry(Vec<u8>),
     /// The value is a date32
     ///
     /// The `i32` represents the number of days since the Unix epoch (1970-01-01).
@@ -59,17 +82,17 @@ pub enum Value {
         /// nanos
         nanos: i64,
     },
-    /// The value is a list
+    /// The value is a list.
     List(Vec<Value>),
     /// The value is an enum
     Enum(String),
-    /// The value is a struct
+    /// The value is a struct.
     Struct(OrderedMap<String, Value>),
-    /// The value is an array
+    /// The value is an array.
     Array(Vec<Value>),
-    /// The value is a map
+    /// The value is a map.
     Map(OrderedMap<Value, Value>),
-    /// The value is a union
+    /// The value is a union.
     Union(Box<Value>),
 }
 
@@ -172,6 +195,20 @@ impl From<i128> for Value {
     }
 }
 
+impl From<u128> for Value {
+    #[inline]
+    fn from(i: u128) -> Self {
+        Self::UHugeInt(i)
+    }
+}
+
+impl From<Decimal> for Value {
+    #[inline]
+    fn from(decimal: Decimal) -> Self {
+        Self::Decimal(decimal)
+    }
+}
+
 impl From<f32> for Value {
     #[inline]
     fn from(f: f32) -> Self {
@@ -225,6 +262,7 @@ impl Value {
             Self::Int(_) => Type::Int,
             Self::BigInt(_) => Type::BigInt,
             Self::HugeInt(_) => Type::HugeInt,
+            Self::UHugeInt(_) => Type::UHugeInt,
             Self::UTinyInt(_) => Type::UTinyInt,
             Self::USmallInt(_) => Type::USmallInt,
             Self::UInt(_) => Type::UInt,
@@ -235,6 +273,7 @@ impl Value {
             Self::Timestamp(_, _) => Type::Timestamp,
             Self::Text(_) => Type::Text,
             Self::Blob(_) => Type::Blob,
+            Self::Geometry(_) => Type::Geometry,
             Self::Date32(_) => Type::Date32,
             Self::Time64(..) => Type::Time64,
             Self::Interval { .. } => Type::Interval,

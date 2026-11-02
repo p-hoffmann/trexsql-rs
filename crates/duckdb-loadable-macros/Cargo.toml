@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-loadable-macros"
-version = "0.1.14"
+version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
@@ -11,6 +11,10 @@ categories = ["external-ffi-bindings", "database"]
 description = "Native bindings to the libduckdb library, C API; build loadable extensions"
 edition = { workspace = true }
 rust-version = { workspace = true }
+
+[features]
+# Derives for duckdb-neo's raw handle traits.
+neo = []
 
 [dependencies]
 darling = "0.20.10"

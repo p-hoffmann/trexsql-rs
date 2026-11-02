@@ -1,9 +1,8 @@
 use std::{error::Error, fmt};
 
 use cast;
-use rust_decimal::RoundingStrategy::MidpointAwayFromZero;
 
-use super::{TimeUnit, Value, ValueRef};
+use super::{Decimal, TimeUnit, Value, ValueRef};
 
 /// Enum listing possible errors from [`FromSql`] trait.
 #[derive(Debug)]
@@ -16,6 +15,11 @@ pub enum FromSqlError {
     /// Error when the value returned by DuckDB cannot be stored into the
     /// requested type.
     OutOfRange(i128),
+
+    /// Error when an unsigned 128-bit value returned by DuckDB cannot be
+    /// stored into the requested type. This is reported for `UHUGEINT` sources;
+    /// same-magnitude signed sources use [`Self::OutOfRange`].
+    OutOfRangeUnsigned(u128),
 
     /// `feature = "uuid"` Error returned when reading a `uuid` from a blob with
     /// a size other than 16. Only available when the `uuid` feature is enabled.
@@ -31,6 +35,7 @@ impl PartialEq for FromSqlError {
         match (self, other) {
             (Self::InvalidType, Self::InvalidType) => true,
             (Self::OutOfRange(n1), Self::OutOfRange(n2)) => n1 == n2,
+            (Self::OutOfRangeUnsigned(n1), Self::OutOfRangeUnsigned(n2)) => n1 == n2,
             #[cfg(feature = "uuid")]
             (Self::InvalidUuidSize(s1), Self::InvalidUuidSize(s2)) => s1 == s2,
             (..) => false,
@@ -43,6 +48,7 @@ impl fmt::Display for FromSqlError {
         match *self {
             Self::InvalidType => write!(f, "Invalid type"),
             Self::OutOfRange(i) => write!(f, "Value {i} out of range"),
+            Self::OutOfRangeUnsigned(i) => write!(f, "Unsigned value {i} out of range"),
             #[cfg(feature = "uuid")]
             Self::InvalidUuidSize(s) => {
                 write!(f, "Cannot read UUID value out of {s} byte blob")
@@ -54,7 +60,7 @@ impl fmt::Display for FromSqlError {
 
 impl Error for FromSqlError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        if let Self::Other(ref err) = self {
+        if let Self::Other(err) = self {
             Some(&**err)
         } else {
             None
@@ -71,8 +77,40 @@ pub trait FromSql: Sized {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self>;
 }
 
-macro_rules! from_sql_integral(
-    ($t:ident) => (
+fn rounded_decimal(value: i128, scale: u8) -> Option<i128> {
+    let divisor = 10_i128.checked_pow(u32::from(scale))?;
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+
+    // Mirror DuckDB's DECIMAL-to-INTEGER cast: round to nearest, with
+    // fractional ties rounded away from zero.
+    if remainder.unsigned_abs() * 2 < divisor as u128 {
+        return Some(quotient);
+    }
+
+    if value.is_negative() {
+        quotient.checked_sub(1)
+    } else {
+        quotient.checked_add(1)
+    }
+}
+
+fn rounded_decimal_result(value: i128, scale: u8) -> FromSqlResult<i128> {
+    rounded_decimal(value, scale).ok_or(FromSqlError::OutOfRange(value))
+}
+
+fn decimal_to_f32(decimal: Decimal) -> f32 {
+    // Preserve decimal scale, while inheriting normal binary float precision loss.
+    decimal.value() as f32 / 10_f32.powi(i32::from(decimal.scale()))
+}
+
+fn decimal_to_f64(decimal: Decimal) -> f64 {
+    // Preserve decimal scale, while inheriting normal binary float precision loss.
+    decimal.value() as f64 / 10_f64.powi(i32::from(decimal.scale()))
+}
+
+macro_rules! from_sql_numeric(
+    ($t:ident, $decimal:expr) => (
         impl FromSql for $t {
             #[inline]
             fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
@@ -82,6 +120,8 @@ macro_rules! from_sql_integral(
                     ValueRef::Int(i) => <$t as cast::From<i32>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
                     ValueRef::BigInt(i) => <$t as cast::From<i64>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
                     ValueRef::HugeInt(i) => <$t as cast::From<i128>>::cast(i).into_result(FromSqlError::OutOfRange(i)),
+                    ValueRef::UHugeInt(i) => <$t as cast::From<u128>>::cast(i)
+                        .into_result(FromSqlError::OutOfRangeUnsigned(i)),
 
                     ValueRef::UTinyInt(i) => <$t as cast::From<u8>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
                     ValueRef::USmallInt(i) => <$t as cast::From<u16>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
@@ -91,11 +131,7 @@ macro_rules! from_sql_integral(
                     ValueRef::Float(i) => <$t as cast::From<f32>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
                     ValueRef::Double(i) => <$t as cast::From<f64>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
 
-                    ValueRef::Decimal(d) => {
-                         // DuckDB rounds DECIMAL to INTEGER (following PostgreSQL behavior)
-                        let rounded = d.round_dp_with_strategy(0, MidpointAwayFromZero);
-                        <$t as cast::From<i128>>::cast(rounded.mantissa()).into_result(FromSqlError::OutOfRange(d.mantissa()))
-                    }
+                    ValueRef::Decimal(decimal) => ($decimal)(decimal),
 
                     ValueRef::Timestamp(_, i) => <$t as cast::From<i64>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
                     ValueRef::Date32(i) => <$t as cast::From<i32>>::cast(i).into_result(FromSqlError::OutOfRange(i as i128)),
@@ -112,6 +148,22 @@ macro_rules! from_sql_integral(
                 }
             }
         }
+    )
+);
+
+macro_rules! from_sql_integral(
+    ($t:ident) => (
+        from_sql_numeric!($t, |decimal: Decimal| {
+            let rounded = rounded_decimal_result(decimal.value(), decimal.scale())?;
+            <$t as cast::From<i128>>::cast(rounded)
+                .into_result(FromSqlError::OutOfRange(rounded))
+        });
+    )
+);
+
+macro_rules! from_sql_float(
+    ($t:ident, $decimal_to_float:ident) => (
+        from_sql_numeric!($t, |decimal: Decimal| Ok($decimal_to_float(decimal)));
     )
 );
 
@@ -146,6 +198,7 @@ into_result_integral!(u8);
 into_result_integral!(u16);
 into_result_integral!(u32);
 into_result_integral!(u64);
+into_result_integral!(u128);
 into_result_integral!(usize);
 into_result_integral!(f32);
 into_result_integral!(f64);
@@ -169,9 +222,10 @@ from_sql_integral!(u8);
 from_sql_integral!(u16);
 from_sql_integral!(u32);
 from_sql_integral!(u64);
+from_sql_integral!(u128);
 from_sql_integral!(usize);
-from_sql_integral!(f32);
-from_sql_integral!(f64);
+from_sql_float!(f32, decimal_to_f32);
+from_sql_float!(f64, decimal_to_f64);
 
 impl FromSql for bool {
     #[inline]
@@ -266,7 +320,7 @@ impl FromSql for Value {
 
 #[cfg(test)]
 mod test {
-    use super::FromSql;
+    use super::{FromSql, FromSqlError};
     use crate::{Connection, Error, Result};
 
     #[test]
@@ -373,6 +427,32 @@ mod test {
         check_ranges::<u8>(&db, &[-2, -1, 256], &[0, 1, 255]);
         check_ranges::<u16>(&db, &[-2, -1, 65536], &[0, 1, 65535]);
         check_ranges::<u32>(&db, &[-2, -1, 4_294_967_296], &[0, 1, 4_294_967_295]);
+
+        let err = db
+            .query_row("SELECT (-1)::HUGEINT", [], |r| r.get::<_, u128>(0))
+            .unwrap_err();
+        match err {
+            Error::IntegralValueOutOfRange(_, value) => assert_eq!(value, -1),
+            _ => panic!("unexpected error: {err}"),
+        }
+
+        let ubigint_max = u128::from(u64::MAX);
+        let value = db.query_row("SELECT (18446744073709551615)::UBIGINT", [], |r| r.get::<_, u128>(0))?;
+        assert_eq!(value, ubigint_max);
+
+        let u64_overflow = ubigint_max + 1;
+        let err = db
+            .query_row("SELECT (18446744073709551616)::UHUGEINT", [], |r| r.get::<_, u64>(0))
+            .unwrap_err();
+        match err {
+            Error::UnsignedIntegralValueOutOfRange(_, value) => assert_eq!(value, u64_overflow),
+            _ => panic!("unexpected error: {err}"),
+        }
+
+        assert_eq!(
+            FromSqlError::OutOfRangeUnsigned(u64_overflow).to_string(),
+            "Unsigned value 18446744073709551616 out of range"
+        );
         Ok(())
     }
 
@@ -554,6 +634,26 @@ mod test {
         );
         assert_eq!(
             db.query_row("SELECT -0.51::DECIMAL(10,2)", [], |row| row.get::<_, i32>(0))?,
+            -1
+        );
+
+        assert_eq!(
+            db.query_row("SELECT 0.50::DECIMAL(38,2)", [], |row| row.get::<_, i32>(0))?,
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT -0.50::DECIMAL(38,2)", [], |row| row.get::<_, i32>(0))?,
+            -1
+        );
+        assert_eq!(
+            db.query_row("SELECT 0.500000000000000000000000000000::DECIMAL(38,30)", [], |row| row
+                .get::<_, i32>(0))?,
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT -0.500000000000000000000000000000::DECIMAL(38,30)", [], |row| {
+                row.get::<_, i32>(0)
+            })?,
             -1
         );
 

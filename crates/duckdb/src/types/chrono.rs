@@ -5,8 +5,8 @@ use num_integer::Integer;
 use std::fmt::Write;
 
 use crate::{
-    types::{FromSql, FromSqlError, FromSqlResult, TimeUnit, ToSql, ToSqlOutput, ValueRef},
     Result,
+    types::{FromSql, FromSqlError, FromSqlResult, TimeUnit, ToSql, ToSqlOutput, ValueRef},
 };
 
 use super::Value;
@@ -83,11 +83,19 @@ impl FromSql for NaiveDateTime {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value {
             ValueRef::Timestamp(tu, t) => {
+                // Floor division keeps the sub-second part non-negative for
+                // timestamps before 1970-01-01.
                 let (secs, nsecs) = match tu {
                     TimeUnit::Second => (t, 0),
-                    TimeUnit::Millisecond => (t / 1000, (t % 1000) * 1_000_000),
-                    TimeUnit::Microsecond => (t / 1_000_000, (t % 1_000_000) * 1000),
-                    TimeUnit::Nanosecond => (t / 1_000_000_000, t % 1_000_000_000),
+                    TimeUnit::Millisecond => {
+                        let (secs, millis) = t.div_mod_floor(&1000);
+                        (secs, millis * 1_000_000)
+                    }
+                    TimeUnit::Microsecond => {
+                        let (secs, micros) = t.div_mod_floor(&1_000_000);
+                        (secs, micros * 1000)
+                    }
+                    TimeUnit::Nanosecond => t.div_mod_floor(&NANOS_PER_SECOND),
                 };
                 Ok(DateTime::from_timestamp(secs, nsecs as u32).unwrap().naive_utc())
             }
@@ -131,17 +139,18 @@ impl FromSql for NaiveDateTime {
 impl<Tz: TimeZone> ToSql for DateTime<Tz> {
     #[inline]
     fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+        let utc = self.with_timezone(&Utc);
         let mut buffer = String::with_capacity(29);
         write!(
             buffer,
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}+00:00",
-            self.year(),
-            self.month(),
-            self.day(),
-            self.hour(),
-            self.minute(),
-            self.second(),
-            self.nanosecond() / 1_000
+            utc.year(),
+            utc.month(),
+            utc.day(),
+            utc.hour(),
+            utc.minute(),
+            utc.second(),
+            utc.nanosecond() / 1_000
         )
         .unwrap();
         Ok(ToSqlOutput::from(buffer))
@@ -209,8 +218,8 @@ impl ToSql for Duration {
 #[cfg(test)]
 mod test {
     use crate::{
-        types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef},
         Connection, Result,
+        types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef, binding_unsupported_value, value_ref_from_value},
     };
     use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Utc};
 
@@ -270,6 +279,21 @@ mod test {
     }
 
     #[test]
+    fn test_naive_date_time_before_epoch() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let expected = NaiveDateTime::parse_from_str("1969-12-31 23:59:59.5", "%F %T%.f").unwrap();
+        for ty in ["TIMESTAMP_MS", "TIMESTAMP", "TIMESTAMP_NS"] {
+            let sql = format!("SELECT '1969-12-31 23:59:59.5'::{ty}");
+            let v: NaiveDateTime = db.query_row(&sql, [], |r| r.get(0))?;
+            assert_eq!(expected, v, "{ty}");
+        }
+
+        let utc: DateTime<Utc> = db.query_row("SELECT TIMESTAMP '1900-01-01 00:00:00.000001'", [], |r| r.get(0))?;
+        assert_eq!("1900-01-01 00:00:00.000001 UTC", utc.to_string());
+        Ok(())
+    }
+
+    #[test]
     fn test_date_time_utc() -> Result<()> {
         let db = checked_memory_handle()?;
         let date = NaiveDate::from_ymd_opt(2016, 2, 23).unwrap();
@@ -318,7 +342,7 @@ mod test {
         let sqled = td.to_sql().unwrap();
         let value = match sqled {
             ToSqlOutput::Borrowed(v) => v,
-            ToSqlOutput::Owned(ref v) => ValueRef::from(v),
+            ToSqlOutput::Owned(ref v) => value_ref_from_value(v, binding_unsupported_value).unwrap(),
         };
         let reversed = FromSql::column_result(value).unwrap();
 
