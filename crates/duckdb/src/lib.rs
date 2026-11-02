@@ -901,6 +901,28 @@ mod test {
         }
     }
 
+    // trex: extensions share their host's instance via raw_database()/open_from_raw.
+    #[test]
+    fn raw_database_roundtrip() -> Result<()> {
+        let first = Connection::open_in_memory()?;
+        let raw = first.raw_database();
+        assert!(!raw.is_null());
+        let second = unsafe { Connection::open_from_raw(raw) }?;
+
+        first.execute_batch("CREATE TABLE t AS SELECT 1")?;
+        let count: i64 = second.query_row("SELECT count(*) FROM t", [], |r| r.get(0))?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn engine_version_is_v2() -> Result<()> {
+        let db = checked_memory_handle();
+        let version: String = db.query_row("SELECT version()", [], |r| r.get(0))?;
+        assert_eq!(version, "v2.0.0");
+        Ok(())
+    }
+
     #[test]
     fn test_open_failure() -> Result<()> {
         let filename = "no_such_file.db";
