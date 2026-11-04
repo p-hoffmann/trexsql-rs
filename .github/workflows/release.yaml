@@ -35,7 +35,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          # libssl/libcurl: the bundled quack and httpfs extensions link them.
+          sudo apt-get install -y cmake ninja-build libssl-dev libcurl4-openssl-dev
 
       - name: Extract public key from signing key
         env:
@@ -54,12 +55,18 @@ jobs:
           if [ -f ${{ github.workspace }}/signing_key.pub ]; then
             SIGNING_KEY_ARG="-DDUCKDB_CUSTOM_SIGNING_KEYS=${{ github.workspace }}/signing_key.pub"
           fi
+          # quack (client and server of the Quack protocol) and httpfs (which it
+          # needs for HTTP and crypto) are linked in, so jdbc:trexsql:// clients
+          # and quack_serve work without downloading extensions.
+          EXT_CONFIGS=$PWD/.github/config/extensions
           mkdir -p build/release && cd build/release
           cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=1 \
             -DBUILD_UNITTESTS=OFF \
             -DBUILD_SHELL=OFF \
             -DOVERRIDE_GIT_DESCRIBE="$TREXSQL_VERSION" \
+            "-DDUCKDB_EXTENSION_CONFIGS=$EXT_CONFIGS/httpfs.cmake;$EXT_CONFIGS/quack.cmake" \
+            "-DSTATICALLY_LINK_EXTENSIONS=core_functions;parquet;json;icu;httpfs;quack" \
             $SIGNING_KEY_ARG
           cmake --build . --config Release --target trexsql
         working-directory: crates/libduckdb-sys/duckdb-sources
@@ -69,6 +76,27 @@ jobs:
           mkdir -p libtrexsql
           cp crates/libduckdb-sys/duckdb-sources/build/release/src/libtrexsql.so libtrexsql/libtrexsql.so
           cp crates/libduckdb-sys/duckdb-sources/src/include/duckdb.h libtrexsql/
+
+      - name: Check bundled extensions
+        run: |
+          python3 - libtrexsql/libtrexsql.so <<'PY'
+          import ctypes, sys
+          lib = ctypes.CDLL(sys.argv[1])
+          lib.duckdb_value_varchar.restype = ctypes.c_char_p
+          db, con = ctypes.c_void_p(), ctypes.c_void_p()
+          assert lib.duckdb_open(None, ctypes.byref(db)) == 0
+          assert lib.duckdb_connect(db, ctypes.byref(con)) == 0
+          res = (ctypes.c_byte * 64)()
+          sql = (b"SELECT extension_name FROM duckdb_extensions() WHERE loaded "
+                 b"AND install_mode = 'STATICALLY_LINKED' AND extension_name IN ('quack', 'httpfs')")
+          assert lib.duckdb_query(con, sql, ctypes.byref(res)) == 0
+          names = {lib.duckdb_value_varchar(ctypes.byref(res), 0, i).decode()
+                   for i in range(lib.duckdb_row_count(ctypes.byref(res)))}
+          print("statically linked:", sorted(names))
+          sys.exit(0 if names == {"quack", "httpfs"} else 1)
+          PY
+        env:
+          TREX_EXTENSIONS: none
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
