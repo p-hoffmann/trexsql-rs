@@ -82,6 +82,7 @@ pub mod scalar;
 pub mod schema;
 pub mod signature;
 pub mod statement;
+pub mod storage_extension;
 pub mod table_function;
 pub mod tokens;
 pub mod types;
