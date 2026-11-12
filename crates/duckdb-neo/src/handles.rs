@@ -273,6 +273,49 @@ define_handle! {
     },
 }
 
+define_handle! {
+    name: StorageExtensionBuilderHandle,
+    handle: ffi::duckdb_v2_storage_extension_handle,
+    destroy: ffi::duckdb_v2_storage_extension_destroy,
+}
+
+/// What a storage extension registers through; registration also takes the storage type name.
+pub(crate) trait StorageExtensionBuilderLink {
+    fn create_storage_extension_handle(&self) -> crate::Result<StorageExtensionBuilderHandle>;
+
+    fn register_storage_extension_handle(
+        &self,
+        handle: StorageExtensionBuilderHandle,
+        type_name: &str,
+    ) -> crate::Result<()>;
+}
+
+macro_rules! impl_storage_extension_link {
+    ($($type:ty => $register:expr),* $(,)?) => {
+        $(
+            impl StorageExtensionBuilderLink for $type {
+                fn create_storage_extension_handle(&self) -> crate::Result<StorageExtensionBuilderHandle> {
+                    check_api_call!(ffi::duckdb_v2_storage_extension_create, self.factory()?.raw(), RET)
+                        .map(StorageExtensionBuilderHandle)
+                }
+
+                fn register_storage_extension_handle(
+                    &self,
+                    handle: StorageExtensionBuilderHandle,
+                    type_name: &str,
+                ) -> crate::Result<()> {
+                    check_api_call!($register, self.raw(), &type_name.into(), handle.raw())
+                }
+            }
+        )*
+    };
+}
+
+impl_storage_extension_link! {
+    Instance => ffi::duckdb_v2_instance_register_storage_extension,
+    Extension => ffi::duckdb_v2_extension_register_storage_extension,
+}
+
 define_handle_column_data_collection! {
     name: ColumnDataCollectionAppendStateHandle,
     link: ColumnDataCollectionAppendLink,
